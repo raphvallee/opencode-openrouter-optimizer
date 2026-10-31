@@ -150,6 +150,11 @@ export class OpenCodeStats {
   /** Profiles for every model OpenCode has served; cached per TTL, one process at a time. */
   async get(): Promise<Map<string, LocalProfile>> {
     if (this.cached && Date.now() - this.fetchedAt < this.ttlMs) return this.cached
+    // A failed first fetch is held for the TTL too: without this, every get() would
+    // respawn the CLI per model refresh while still returning nothing useful.
+    if (!this.cached && this.fetchedAt !== 0 && Date.now() - this.fetchedAt < this.ttlMs) {
+      return new Map<string, LocalProfile>()
+    }
     if (!this.inflight) {
       this.inflight = this.fetchAll()
         .then((profiles) => {

@@ -166,6 +166,31 @@ describe("http.request hook", () => {
 })
 
 describe("hot path", () => {
+  test("a hook error is contained: requests pass through after the DB is closed", async () => {
+    const { ctx, hooks } = makeCtx({})
+    const plugin = definePlugin({
+      dbPath: ":memory:",
+      statsRun: async () => JSON.stringify({ models: [] }),
+    } as never)
+    const cleanup = await plugin.setup!(ctx as never)
+    await cleanup?.()
+
+    const warnings: string[] = []
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    })
+    try {
+      const handler = hooks.get("http.request")!.handler
+      const evt = { request: openRouterRequest(), model: { providerID: "openrouter", modelID: "vendor/model" }, kind: "primary" }
+      // stateFor hits the closed DB, the hook guard catches it and the request passes through.
+      await handler(evt)
+      expect(JSON.parse(await (evt as { request: Request }).request.text()).model).toBe("vendor/model")
+      expect(warnings.some((line) => line.includes("routing skipped"))).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   test("uses the event model ref and leaves the body untouched when no blacklist exists", async () => {
     const savedFetch = globalThis.fetch
     const realFetch = savedFetch.bind(globalThis)

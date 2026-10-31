@@ -34,7 +34,10 @@ because OpenCode request shapes do not depend on the provider) and OpenRouter Ac
 rows (all clients using the OpenRouter account), treated as equals. Providers claim the
 best surviving endpoint among the aliases they expose. Endpoints without tool support,
 under 64k context, under 8k max completion tokens or under 90% uptime are excluded from
-ranking, so blocked-but-cheap providers cannot break OpenCode sessions.
+ranking and blacklisted alongside the non-surviving providers, so the injected
+`provider.sort: "price"` cannot steer traffic to a cheap-but-broken endpoint. When no
+endpoint passes the filters, the plugin passes requests through (only `extraIgnore` is
+enforced) rather than blocking every known route.
 
 ### Free-priority mode
 

@@ -146,6 +146,29 @@ describe("OpenCodeStats", () => {
     const fallback = await stats.get()
     expect(fallback.get("vendor/model")?.requests).toBe(4)
   })
+
+  test("a failed first fetch is held for the TTL instead of respawning the CLI every get()", async () => {
+    let calls = 0
+    const stats = new OpenCodeStats({
+      ttlMs: 60_000,
+      run: async () => {
+        calls++
+        throw new Error("boom")
+      },
+    })
+
+    const empty = await stats.get()
+    expect(empty.size).toBe(0)
+    // Within the TTL, repeated get() calls reuse the failure window, not new processes.
+    await stats.get()
+    await stats.get()
+    expect(calls).toBe(1)
+
+    // An explicit invalidate() still forces a retry.
+    stats.invalidate()
+    await stats.get()
+    expect(calls).toBe(2)
+  })
 })
 
 describe("mergeProfile", () => {

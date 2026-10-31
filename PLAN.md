@@ -142,7 +142,11 @@ test/                    bun test: pricing formula, ranking, merge math, db roun
 - Endpoints and Activity calls have a 15s timeout composed with the plugin shutdown signal.
 - Any hook error is caught and the request continues unmodified.
 - Providers that vanish from the endpoints list between fetches are cleared from the
-  blacklist, and new providers are never added to the blacklist until ranked.
+  blacklist, and new providers are never added to the blacklist until ranked. Providers
+  whose endpoints fail the filters are known slugs, so they are blacklisted too - but
+  only while at least one survivor keeps the route open.
+- A first-ever `opencode stats` failure is held for the snapshot TTL and warned once;
+  afterwards the merge falls back to defaults instead of respawning the CLI per refresh.
 - Free mode: paid providers are blacklisted the moment a filter-passing provider offers
   the model at $0; the next TTL refresh drops the mode if prices change.
 

@@ -3,7 +3,7 @@
 import { Plugin } from "@opencode/plugin"
 import { DEFAULT_OPTIONS, resolveOptions, type OptimizerOptions } from "./config"
 import { OptimizerDb, routingStateFromRow, type RoutingSnapshot, type RoutingState } from "./db"
-import { fetchModelEndpoints, fetchOpenRouterProfile } from "./openrouter"
+import { fetchModelEndpoints, fetchOpenRouterProfile, baseModelSlug } from "./openrouter"
 import { composeRouting, rankProviders, type ProviderRank } from "./ranking"
 import { mergeProfile, OpenCodeStats, type LocalProfile } from "./stats"
 
@@ -34,6 +34,10 @@ function emptyState(model: string): RoutingState {
   }
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError"
+}
+
 export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
   return Plugin.define({
     id: "openrouter-optimizer",
@@ -52,21 +56,43 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       const ttlMs = options.ttlHours * 3_600_000
       const inflight = new Map<string, Promise<void>>()
       const controller = new AbortController()
+      let statsWarned = false
       const stats = new OpenCodeStats({
         command: options.statsCommand,
         days: options.statsDays,
         ttlMs: options.statsCacheMinutes * 60_000,
         run: options.statsRun,
-        log: (message) => debug(message),
+        // A broken stats CLI silently degrades every profile to fallbacks, which can
+        // rank the wrong providers cheapest. The first failure is therefore a real
+        // warning; repeats stay quiet (debug) until the process restarts.
+        log: (message) => {
+          if (statsWarned) {
+            debug(message)
+            return
+          }
+          statsWarned = true
+          warn(`opencode stats unavailable, ranking falls back to defaults until it recovers: ${message}`)
+        },
       })
 
-      const managementKey = process.env[options.managementKeyEnv]
+      // Read per refresh: the key may be exported after the plugin loaded.
+      const managementKey = () => process.env[options.managementKeyEnv]
+
+      // One-time notices per model: a ranking with zero survivors passes requests
+      // through unrouted, which must not be invisible.
+      const unroutedWarned = new Set<string>()
 
       // Hot path state: warm the cache once, then every request is a map lookup.
       // The DB stays durable; another process may refresh behind us, which is bounded
       // by the same TTL the routing decisions already use.
       const routes = new Map<string, RoutingState>()
-      for (const state of db.loadRoutingStates(options.debug)) routes.set(state.model, state)
+      // Bases of models whose stored routing came in under a variant key: when the
+      // event ref has no ranking of its own, the request body may name such a variant.
+      const routedVariantBase = new Set<string>()
+      for (const state of db.loadRoutingStates(options.debug)) {
+        routes.set(state.model, state)
+        if (state.routing && state.routing.blacklist.length > 0) routedVariantBase.add(baseModelSlug(state.model))
+      }
 
       /** Resolve one model's state, reading the DB at most once per process. */
       function stateFor(model: string, now: number): RoutingState {
@@ -81,14 +107,15 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       async function buildProfile(model: string) {
         // Both sources run concurrently in the background task; both snapshots are
         // cached and single-flighted across models.
+        const key = managementKey()
         const [statsResult, remoteResult] = await Promise.allSettled([
           stats.get(),
-          managementKey ? fetchOpenRouterProfile(model, managementKey, { signal: controller.signal }) : Promise.resolve(undefined),
+          key ? fetchOpenRouterProfile(model, key, { signal: controller.signal }) : Promise.resolve(undefined),
         ])
         let local: LocalProfile | undefined
         if (statsResult.status === "fulfilled") local = stats.pick(model)
         let remote
-        if (managementKey) {
+        if (key) {
           if (remoteResult.status === "fulfilled") remote = remoteResult.value
           else {
             warn(`activity fetch failed for ${model}:`, remoteResult.reason instanceof Error ? remoteResult.reason.message : remoteResult.reason)
@@ -128,19 +155,46 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           state.routing = routing
           if (options.debug) state.details = ranking.rankings
           routes.set(model, state)
+          // Track routed bases so variant-suffixed request bodies can find their
+          // routing even when the event ref itself has no ranking yet.
+          if (routing.survivors.length === 0 && routing.blacklist.length === 0) {
+            // Nothing is enforced and requests pass through unrouted; make that
+            // visible once per model per process instead of debug-only.
+            if (!unroutedWarned.has(model)) {
+              unroutedWarned.add(model)
+              warn(`${model}: no endpoint passed the filters, requests pass through unrouted`)
+            }
+          } else {
+            routedVariantBase.add(baseModelSlug(model))
+          }
 
           debug(
             `ranked ${model} (${routing.mode}): top ${routing.survivors.length} = [${routing.survivors.join(", ")}]`,
             `blacklist size ${routing.blacklist.length}`,
           )
         } catch (error) {
+          // A shutdown abort cancels the refresh; it is not a refresh failure and the
+          // DB may already be closing, so skip failure bookkeeping entirely.
+          if (controller.signal.aborted || isAbortError(error)) return
           const failedAt = Date.now()
           const state = routes.get(model) ?? emptyState(model)
           state.attempts += 1
           state.lastAttempt = failedAt
           state.retryAfter = failedAt + backoffMs(state.attempts)
           routes.set(model, state)
-          db.recordFailure(model, failedAt, state.retryAfter)
+          try {
+            db.recordFailure(model, failedAt, state.retryAfter)
+            // Other processes record failures into the same row; the DB is the
+            // shared truth for the attempt count that drives backoff duration.
+            const row = db.getFetch(model)
+            if (row) {
+              state.attempts = row.attempts
+              state.lastAttempt = row.last_attempt ?? failedAt
+              state.retryAfter = row.retry_after ?? state.retryAfter
+            }
+          } catch (dbError) {
+            warn(`failure bookkeeping failed for ${model}:`, dbError instanceof Error ? dbError.message : dbError)
+          }
           warn(`refresh failed for ${model}:`, error instanceof Error ? error.message : error)
         }
       }
@@ -153,6 +207,9 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         if (fresh) return
         if (state.retryAfter !== null && now < state.retryAfter) return
         const task = refreshModel(model).finally(() => inflight.delete(model))
+        // refreshModel handles its own errors, but its failure bookkeeping can still
+        // reject (locked/closed DB): never leave an unhandled rejection behind.
+        task.catch(() => {})
         inflight.set(model, task)
         void task
       }
@@ -182,8 +239,8 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         )
       }
 
-      await ctx.session.hook("http.request", async (event) => {
-        const evt = event as unknown as HttpEventLike
+      /** The full routing pass for one request; throws bubble to the hook guard below. */
+      async function routeRequest(evt: HttpEventLike): Promise<void> {
         const request = evt.request
         if (!request) return
         const url = request.url ?? ""
@@ -194,15 +251,23 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         const now = Date.now()
         const refModel = typeof evt.model?.modelID === "string" ? evt.model.modelID : ""
 
-        // Fast path: the event already names the model. If it has no blacklist, there is
-        // nothing to inject, so the request body is never read, parsed or rebuilt.
+        // Fast path: the event already names the model. If it was ranked and has no
+        // blacklist, there is nothing to inject, so the request body is never read,
+        // parsed or rebuilt.
         let state: RoutingState | undefined
         if (refModel) {
           state = stateFor(refModel, now)
           ensureFresh(state, now)
-          if (!state.routing || state.routing.blacklist.length === 0) {
+          const refRouting = state.routing
+          if (refRouting && refRouting.blacklist.length === 0) {
             logRouting(refModel, state)
             return
+          }
+          if (!refRouting) {
+            logRouting(refModel, state)
+            // No ranking yet. The body may name a variant of this model that carries
+            // its own routing; keep inspecting for those, pass the rest through.
+            if (!routedVariantBase.has(baseModelSlug(refModel))) return
           }
         }
 
@@ -256,11 +321,26 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           warn("request rebuild failed:", error instanceof Error ? error.message : error)
           return
         }
+      }
+
+      await ctx.session.hook("http.request", async (event) => {
+        const evt = event as unknown as HttpEventLike
+        // Any hook error is caught and the request continues unmodified: a DB hiccup
+        // (SQLITE_BUSY, closed DB) must never fail or stall a user request.
+        try {
+          await routeRequest(evt)
+        } catch (error) {
+          warn("routing skipped, request passes through:", error instanceof Error ? error.message : error)
+        }
       })
 
-      return () => {
+      return async () => {
         controller.abort()
+        const pending = [...inflight.values()]
         inflight.clear()
+        // Wait for in-flight refreshes so their failure bookkeeping never races the
+        // DB close below (aborted refreshes are not recorded as failures).
+        await Promise.allSettled(pending)
         routes.clear()
         db.close()
       }

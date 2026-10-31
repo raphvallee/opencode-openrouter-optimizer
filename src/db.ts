@@ -239,6 +239,7 @@ export class OptimizerDb {
   private readonly recordFailureStmt: Statement
   private readonly upsertRanking: Statement
   private readonly touchFetch: Statement
+  private closed = false
 
   constructor(path?: string) {
     const file = openPath(path)
@@ -303,13 +304,20 @@ export class OptimizerDb {
     `)
   }
 
+  /** Throwing early beats a confusing "database is closed" sqlite error mid-statement. */
+  private assertOpen(): void {
+    if (this.closed) throw new Error("optimizer db is closed")
+  }
+
   /** Exact model row; last_fetched === null means "prices were never fetched". */
   getFetch(model: string): FetchRow | undefined {
+    this.assertOpen()
     return this.selectFetch.get(model) as FetchRow | undefined
   }
 
   /** One INSERT OR IGNORE plus one SELECT, instead of SELECT/INSERT/SELECT. */
   ensureFetchRow(model: string, now: number): FetchRow {
+    this.assertOpen()
     this.insertFetchRow.run(model, now)
     return this.selectFetch.get(model) as FetchRow
   }
@@ -328,6 +336,7 @@ export class OptimizerDb {
 
   /** Persist one successful refresh in a single UPSERT (QW-8). */
   saveRefresh(model: string, routing: RoutingSnapshot, now: number, details?: unknown[]): void {
+    this.assertOpen()
     this.saveRefreshStmt.run(
       model,
       now,
@@ -343,11 +352,13 @@ export class OptimizerDb {
 
   /** Persist a failed attempt with its backoff deadline. */
   recordFailure(model: string, now: number, retryAfter: number): void {
+    this.assertOpen()
     this.recordFailureStmt.run(model, now, retryAfter, now)
   }
 
   /** Legacy-compatible fetch write: last_fetched only, no endpoint payload. */
   recordFetch(model: string, _endpoints: unknown, now: number): void {
+    this.assertOpen()
     this.touchFetch.run(model, now, now)
   }
 
@@ -377,6 +388,8 @@ export class OptimizerDb {
   }
 
   close(): void {
+    if (this.closed) return
+    this.closed = true
     this.db.close()
   }
 }

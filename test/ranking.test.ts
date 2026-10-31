@@ -75,11 +75,28 @@ describe("rankProviders", () => {
     expect(ranking.rankings[0].total).toBeCloseTo(0.0011 * 120)
   })
 
-  test("blacklist contains every non-surviving provider plus extraIgnore", () => {
+  test("blacklist contains every non-surviving provider, filtered-out providers and extraIgnore", () => {
     const options = { ...DEFAULT_OPTIONS, extraIgnore: ["zed"] }
     const ranking = rankProviders(endpoints, profile, options)
-    // theta was filtered out, so only listed slugs plus extraIgnore appear
-    expect(ranking.blacklist).toEqual(["alpha", "epsilon", "zed"])
+    // theta was filtered out (low uptime), but it is a known provider slug: with
+    // survivors present it is blacklisted so sort:"price" cannot steer traffic to it.
+    expect(ranking.blacklist).toEqual(["alpha", "epsilon", "theta", "zed"])
+  })
+
+  test("filtered-out providers are only enforced when a survivor keeps the route open", () => {
+    // Every endpoint filtered out: survivors is empty, so only extraIgnore applies
+    // and requests pass through rather than losing every known route.
+    const options = { ...DEFAULT_OPTIONS, extraIgnore: ["zed"] }
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "theta", tag: "theta/fp8", uptime_last_30m: 40 }),
+        endpoint({ provider_name: "iota", tag: "iota/fp8", context_length: 24_000 }),
+      ],
+      profile,
+      options,
+    )
+    expect(ranking.survivors).toEqual([])
+    expect(ranking.blacklist).toEqual(["zed"])
   })
 
   test("discounted providers rank with d applied", () => {
@@ -106,6 +123,11 @@ describe("composeRouting", () => {
   test("injects ignore and sort, preserving user-provided provider options", () => {
     const routing = composeRouting({ require_parameters: true }, ["alpha", "epsilon"], DEFAULT_OPTIONS)
     expect(routing).toEqual({ require_parameters: true, sort: "price", ignore: ["alpha", "epsilon"] })
+  })
+
+  test("array-form provider becomes an order preference instead of being dropped", () => {
+    const routing = composeRouting(["alpha", "beta"], ["alpha"], DEFAULT_OPTIONS)
+    expect(routing).toEqual({ order: ["alpha", "beta"], sort: "price", ignore: ["alpha"] })
   })
 
   test("without a blacklist only the sort is injected", () => {
@@ -168,7 +190,8 @@ describe("free-priority mode", () => {
 
   test("free detection only counts endpoints that pass the filters", () => {
     // The free provider's only endpoint has a 24k context: filtered out, so the plugin
-    // cannot rely on it and stays in cheapest mode.
+    // cannot rely on it and stays in cheapest mode. But free1 is a known slug and
+    // survivors exist, so the broken endpoint's provider is blacklisted.
     const brokenFree = endpoint({
       provider_name: "free1",
       tag: "free1/fp8",
@@ -178,7 +201,7 @@ describe("free-priority mode", () => {
     const ranking = rankProviders([brokenFree, ...paidEndpoints], profile, DEFAULT_OPTIONS)
     expect(ranking.mode).toBe("cheapest")
     expect(ranking.survivors).toEqual(["alpha", "beta", "gamma"])
-    expect(ranking.blacklist).toEqual([])
+    expect(ranking.blacklist).toEqual(["free1"])
   })
 
   test("preferFreeProviders=false restores the plain cost ranking", () => {

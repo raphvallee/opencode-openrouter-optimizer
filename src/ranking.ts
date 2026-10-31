@@ -82,6 +82,12 @@ export interface Ranking {
  *   routable (topN is ignored: free providers must not be capped), and the blacklist
  *   consists exactly of the paid providers.
  * - "cheapest": usual behavior, topN survivors by per-request cost.
+ *
+ * Filtered-out endpoints are known provider slugs (they came from the endpoints API),
+ * so they are blacklisted too: leaving them routable while injecting `sort: "price"`
+ * would steer OpenRouter straight to the cheap-but-broken providers the filters
+ * excluded. Enforcement requires at least one known-good route: when no endpoint
+ * survives, only the user's extraIgnore is applied and the request passes through.
  */
 export function rankProviders(
   endpoints: OpenRouterEndpoint[],
@@ -91,11 +97,16 @@ export function rankProviders(
   const now = Date.now()
 
   // 1) Endpoint filters: only surviving endpoints can claim "free" or be ranked.
+  //    Filtered slugs are remembered: they are known providers and enforceable.
   const eligible: Array<{ endpoint: OpenRouterEndpoint; slug: string }> = []
+  const filteredSlugs = new Set<string>()
   for (const endpoint of endpoints) {
     const slug = providerSlug(endpoint)
     if (!slug) continue
-    if (filterEndpoint(endpoint, options) !== undefined) continue
+    if (filterEndpoint(endpoint, options) !== undefined) {
+      filteredSlugs.add(slug)
+      continue
+    }
     eligible.push({ endpoint, slug })
   }
 
@@ -131,16 +142,21 @@ export function rankProviders(
   const survivors = freeMode
     ? ordered.map((entry) => entry.slug)
     : ordered.slice(0, options.topN).map((entry) => entry.slug)
-  const survivorSet = new Set(survivors)
 
   // In free mode the paid eligible slugs all go into the blacklist; in cheapest mode
-  // it holds every ranked-but-not-surviving slug. extraIgnore always applies.
-  const blacklist = [
-    ...new Set([
-      ...eligible.map((entry) => entry.slug),
-      ...options.extraIgnore,
-    ].filter((slug) => !survivorSet.has(slug))),
-  ]
+  // it holds every ranked-but-not-surviving slug. Filtered-out slugs are enforceable
+  // (known providers) but only when at least one survivor keeps the route open.
+  // extraIgnore always applies: it is the user's explicit instruction.
+  const survivorSet = new Set(survivors)
+  const blacklist = survivors.length === 0
+    ? [...new Set(options.extraIgnore)]
+    : [
+        ...new Set([
+          ...eligible.map((entry) => entry.slug),
+          ...filteredSlugs,
+          ...options.extraIgnore,
+        ].filter((slug) => !survivorSet.has(slug))),
+      ]
 
   return {
     mode: freeMode ? "free" : "cheapest",
@@ -155,12 +171,16 @@ export function rankProviders(
 /**
  * Compose the OpenRouter `provider` routing block. Existing user-provided routing keys
  * survive; ignore + sort are this plugin's authority when a blacklist is available.
+ * An array-form `provider` is treated as a provider-order preference and folded into
+ * `order` instead of being silently dropped when the block is rewritten.
  */
 export function composeRouting(existing: unknown, blacklist: string[] | undefined, options: OptimizerOptions) {
-  const base =
+  const base: Record<string, unknown> =
     existing && typeof existing === "object" && !Array.isArray(existing)
       ? { ...(existing as Record<string, unknown>) }
-      : {}
+      : Array.isArray(existing)
+        ? { order: [...existing] }
+        : {}
   const routing = { ...base }
   if (options.injectSort && routing.sort === undefined) routing.sort = "price"
   if (blacklist && blacklist.length > 0) routing.ignore = [...blacklist]
