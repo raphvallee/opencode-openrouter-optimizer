@@ -1,0 +1,24 @@
+{
+  "name": "opencode-openrouter-optimizer",
+  "version": "0.1.0",
+  "description": "OpenCode v2 plugin that ranks OpenRouter providers by cost and injects a per-request provider blacklist to keep routes cheap.",
+  "type": "module",
+  "private": true,
+  "main": "./index.ts",
+  "module": "./index.ts",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "inspect": "bun run scripts/inspect.ts",
+    "selfcheck": "bun run scripts/selfcheck.ts",
+    "debug:test": "bun --inspect-wait=6496 run test",
+    "debug:inspect": "bun --inspect-wait=6496 run inspect",
+    "debug:selfcheck": "bun --inspect-wait=6496 run selfcheck"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.2.5",
+    "@types/bun": "^1.4.4",
+    "bun-types": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}

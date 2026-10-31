@@ -1,0 +1,150 @@
+import { Database } from "bun:sqlite"
+import { describe, expect, test } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { OptimizerDb } from "../src/db"
+
+describe("OptimizerDb", () => {
+  test("ensureFetchRow leaves last_fetched null on first sight", () => {
+    const db = new OptimizerDb(":memory:")
+    try {
+      const row = db.ensureFetchRow("vendor/model", 123)
+      expect(row.last_fetched).toBeNull()
+      expect(db.ensureFetchRow("vendor/model", 456).model).toBe("vendor/model")
+    } finally {
+      db.close()
+    }
+  })
+
+  test("recordFetch then setRanking round-trips and recordFetch preserves prior rankings", () => {
+    const db = new OptimizerDb(":memory:")
+    try {
+      db.ensureFetchRow("vendor/model", 100)
+      db.recordFetch("vendor/model", [{ model_id: "vendor/model", name: "x" } as never], 200)
+      expect(db.getFetch("vendor/model")?.last_fetched).toBe(200)
+      expect(db.getRankings("vendor/model")).toBeUndefined()
+
+      db.setRanking("vendor/model", { rankings: [{ slug: "a" }], survivors: ["a"], blacklist: ["b"], computedAt: 300 })
+      const ranking = db.getRankings("vendor/model")
+      expect(ranking?.survivors).toEqual(["a"])
+      expect(ranking?.blacklist).toEqual(["b"])
+
+      // A subsequent fetch (TTL refresh) keeps the old rankings until re-ranked.
+      db.recordFetch("vendor/model", [{ model_id: "vendor/model", name: "y" } as never], 400)
+      expect(db.getRankings("vendor/model")?.survivors).toEqual(["a"])
+      expect(db.getFetch("vendor/model")?.last_fetched).toBe(400)
+    } finally {
+      db.close()
+    }
+  })
+
+  test("saveRefresh writes compact routing and resets failure state in one call", () => {
+    const db = new OptimizerDb(":memory:")
+    try {
+      db.ensureFetchRow("vendor/model", 1)
+      db.recordFailure("vendor/model", 2, 5_000)
+      expect(db.getFetch("vendor/model")?.attempts).toBe(1)
+
+      db.saveRefresh(
+        "vendor/model",
+        { survivors: ["a"], blacklist: ["b"], computedAt: 10, mode: "cheapest" },
+        20,
+        [{ slug: "a", perRequest: 0.1 }],
+      )
+      const row = db.getFetch("vendor/model")!
+      expect(row.last_fetched).toBe(20)
+      expect(row.last_attempt).toBe(20)
+      expect(row.attempts).toBe(0)
+      expect(row.retry_after).toBeNull()
+
+      const ranking = db.getRankings("vendor/model")
+      expect(ranking?.survivors).toEqual(["a"])
+      expect(ranking?.blacklist).toEqual(["b"])
+      expect(ranking?.rankings).toEqual([{ slug: "a", perRequest: 0.1 }])
+
+      // The default (non-debug) refresh stores no detail payload.
+      db.saveRefresh("vendor/lean", { survivors: ["a"], blacklist: [], computedAt: 30 }, 30)
+      expect(db.getFetch("vendor/lean")?.details_json).toBeNull()
+      expect(db.loadRoutingStates(false).find((state) => state.model === "vendor/lean")?.details).toBeUndefined()
+    } finally {
+      db.close()
+    }
+  })
+
+  test("recordFailure increments attempts and stores the backoff deadline", () => {
+    const db = new OptimizerDb(":memory:")
+    try {
+      db.ensureFetchRow("vendor/model", 1)
+      db.recordFailure("vendor/model", 100, 5_000)
+      expect(db.getFetch("vendor/model")).toMatchObject({ attempts: 1, last_attempt: 100, retry_after: 5_000 })
+
+      db.recordFailure("vendor/model", 200, 9_000)
+      expect(db.getFetch("vendor/model")).toMatchObject({ attempts: 2, last_attempt: 200, retry_after: 9_000 })
+    } finally {
+      db.close()
+    }
+  })
+
+  test("loadRoutingStates returns the cached compact view", () => {
+    const db = new OptimizerDb(":memory:")
+    try {
+      db.saveRefresh("vendor/model", { survivors: ["a"], blacklist: ["b"], computedAt: 10, mode: "free" }, 20)
+      const states = db.loadRoutingStates()
+      expect(states).toHaveLength(1)
+      expect(states[0].routing).toEqual({ survivors: ["a"], blacklist: ["b"], computedAt: 10, mode: "free" })
+      expect(states[0].lastFetched).toBe(20)
+    } finally {
+      db.close()
+    }
+  })
+
+  test("migrates a legacy rankings_json/endpoints_json database in place", () => {
+    const dir = mkdtempSync(join(tmpdir(), "optimizer-db-"))
+    const path = join(dir, "legacy.db")
+    const legacy = new Database(path, { create: true })
+    legacy.exec(`
+      CREATE TABLE fetches (
+        model TEXT PRIMARY KEY,
+        last_fetched INTEGER,
+        endpoints_json TEXT,
+        rankings_json TEXT,
+        updated_at INTEGER
+      );
+    `)
+    legacy
+      .prepare(`INSERT INTO fetches (model, last_fetched, endpoints_json, rankings_json, updated_at) VALUES (?, ?, ?, ?, ?)`)
+      .run(
+        "vendor/model",
+        123,
+        JSON.stringify([{ model_id: "vendor/model" }]),
+        JSON.stringify({
+          rankings: [{ slug: "a", perRequest: 0.1 }],
+          survivors: ["a"],
+          blacklist: ["b"],
+          computedAt: 456,
+          mode: "cheapest",
+        }),
+        789,
+      )
+    legacy.close()
+
+    const db = new OptimizerDb(path)
+    try {
+      const row = db.getFetch("vendor/model")!
+      expect(row.last_fetched).toBe(123)
+      expect(row.survivors_json).toBe(JSON.stringify(["a"]))
+      expect(row.blacklist_json).toBe(JSON.stringify(["b"]))
+      expect(row.computed_at).toBe(456)
+      expect(row.details_json).toBe(JSON.stringify([{ slug: "a", perRequest: 0.1 }]))
+      expect(db.getRankings("vendor/model")?.rankings).toEqual([{ slug: "a", perRequest: 0.1 }])
+    } finally {
+      db.close()
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
+      } catch {
+        // Windows can hold the WAL handle briefly; the temp dir is safe to leave behind.
+      }
+    }
+  })
+})

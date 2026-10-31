@@ -1,0 +1,202 @@
+import { describe, expect, test } from "bun:test"
+import { DEFAULT_OPTIONS, resolveOptions } from "../src/config"
+import { composeRouting, filterEndpoint, rankProviders, providerSlug, type OpenRouterEndpoint } from "../src/ranking"
+import { isFreePricing } from "../src/pricing"
+
+function endpoint(overrides: Partial<OpenRouterEndpoint> = {}): OpenRouterEndpoint {
+  return {
+    name: "X | test-model",
+    model_id: "vendor/test-model",
+    context_length: 128_000,
+    max_completion_tokens: 16_384,
+    max_prompt_tokens: null,
+    pricing: { prompt: "0.0000001", completion: "0.0000003", discount: 0 },
+    provider_name: "X",
+    tag: `${overrides.provider_name ?? "vendor"}/fp8`,
+    supported_parameters: ["tools", "tool_choice", "max_tokens"],
+    status: 0,
+    uptime_last_30m: 100,
+    uptime_last_1d: 100,
+    ...overrides,
+  }
+}
+
+const profile = { avgInput: 10_000, avgOutput: 1_000, cacheHitRate: 0.5, numRequests: 120 }
+
+describe("providerSlug", () => {
+  test("uses the tag prefix", () => {
+    expect(providerSlug(endpoint({ tag: "deepinfra/turbo", provider_name: "DeepInfra" }))).toBe("deepinfra")
+  })
+
+  test("falls back to the provider name", () => {
+    expect(providerSlug(endpoint({ tag: "", provider_name: "Akash ML" }))).toBe("akash-ml")
+  })
+})
+
+describe("filterEndpoint", () => {
+  test("drops providers without tool support", () => {
+    const reason = filterEndpoint(
+      endpoint({ supported_parameters: ["response_format"], tag: "x1/fp8", provider_name: "x1" }),
+      DEFAULT_OPTIONS,
+    )
+    expect(reason).toBe("tools")
+  })
+
+  test("drops small context and tiny completion caps and low uptime", () => {
+    expect(filterEndpoint(endpoint({ context_length: 24_000 }), DEFAULT_OPTIONS)).toBe("context")
+    expect(filterEndpoint(endpoint({ max_completion_tokens: 4_096 }), DEFAULT_OPTIONS)).toBe("completion")
+    expect(filterEndpoint(endpoint({ uptime_last_30m: 80 }), DEFAULT_OPTIONS)).toBe("uptime")
+  })
+
+  test("accepts a healthy endpoint", () => {
+    expect(filterEndpoint(endpoint(), DEFAULT_OPTIONS)).toBeUndefined()
+  })
+})
+
+describe("rankProviders", () => {
+  const endpoints = [
+    endpoint({ provider_name: "alpha", tag: "alpha/turbo", pricing: { prompt: "0.0000004", completion: "0.0000004" } }),
+    endpoint({ provider_name: "beta", tag: "beta/fp8", pricing: { prompt: "0.0000001", completion: "0.0000002" } }),
+    endpoint({ provider_name: "gamma", tag: "gamma/fp16", pricing: { prompt: "0.0000002", completion: "0.0000003" } }),
+    endpoint({ provider_name: "delta", tag: "delta/fp8", pricing: { prompt: "0.0000003", completion: "0.0000006" } }),
+    endpoint({ provider_name: "epsilon", tag: "epsilon/fp8", pricing: { prompt: "0.0000006", completion: "0.0000008" } }),
+    // alias endpoint for beta, slightly cheaper completion: still one "beta" slug
+    endpoint({ provider_name: "beta", tag: "beta/fp16", pricing: { prompt: "0.0000001", completion: "0.0000001" } }),
+    // broken endpoint: filtered out entirely
+    endpoint({ provider_name: "theta", tag: "theta/fp8", uptime_last_30m: 40 }),
+  ]
+
+  test("ranks by per-request cost with one entry per provider and best endpoint wins", () => {
+    const ranking = rankProviders(endpoints, profile, DEFAULT_OPTIONS)
+    expect(ranking.rankings.map((rank) => rank.slug)).toEqual(["beta", "gamma", "delta", "alpha", "epsilon"])
+    expect(ranking.survivors).toEqual(["beta", "gamma", "delta"])
+    // input 10k * (0.5*1e-7 + 0.5*(1e-7 + 0)) = 1e-3 ; output 1k * 1e-7 = 1e-4
+    expect(ranking.rankings[0].perRequest).toBeCloseTo(0.0011)
+    expect(ranking.rankings[0].total).toBeCloseTo(0.0011 * 120)
+  })
+
+  test("blacklist contains every non-surviving provider plus extraIgnore", () => {
+    const options = { ...DEFAULT_OPTIONS, extraIgnore: ["zed"] }
+    const ranking = rankProviders(endpoints, profile, options)
+    // theta was filtered out, so only listed slugs plus extraIgnore appear
+    expect(ranking.blacklist).toEqual(["alpha", "epsilon", "zed"])
+  })
+
+  test("discounted providers rank with d applied", () => {
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "alpha", tag: "alpha/turbo", pricing: { prompt: "0.000001", completion: "0.000001", discount: 0.5 } }),
+        endpoint({ provider_name: "beta", tag: "beta/fp8", pricing: { prompt: "0.0000008", completion: "0.0000008" } }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    // alpha effective prompt 0.0000005 < beta 0.0000008
+    expect(ranking.survivors).toEqual(["alpha", "beta"])
+  })
+
+  test("fewer than topN survivors yields an empty blacklist", () => {
+    const ranking = rankProviders(endpoints.slice(0, 2), profile, DEFAULT_OPTIONS)
+    expect(ranking.survivors).toEqual(["beta", "alpha"])
+    expect(ranking.blacklist).toEqual([])
+  })
+})
+
+describe("composeRouting", () => {
+  test("injects ignore and sort, preserving user-provided provider options", () => {
+    const routing = composeRouting({ require_parameters: true }, ["alpha", "epsilon"], DEFAULT_OPTIONS)
+    expect(routing).toEqual({ require_parameters: true, sort: "price", ignore: ["alpha", "epsilon"] })
+  })
+
+  test("without a blacklist only the sort is injected", () => {
+    const routing = composeRouting(undefined, [], DEFAULT_OPTIONS)
+    expect(routing).toEqual({ sort: "price" })
+  })
+
+  test("injectSort=false leaves the body routing-free until a blacklist exists", () => {
+    const options = resolveOptions({ injectSort: false })
+    expect(composeRouting(undefined, [], options)).toEqual({})
+  })
+})
+
+describe("isFreePricing", () => {
+  test("zero input and output is free regardless of formatting", () => {
+    expect(isFreePricing({ prompt: "0", completion: "0" })).toBe(true)
+    expect(isFreePricing({ prompt: "0.0", completion: "0.0", input_cache_read: "0" })).toBe(true)
+    expect(isFreePricing({ prompt: 0, completion: 0 })).toBe(true)
+  })
+
+  test("any nonzero required side is paid", () => {
+    expect(isFreePricing({ prompt: "0", completion: "0.0000001" })).toBe(false)
+    expect(isFreePricing({ prompt: "0.0000001", completion: "0" })).toBe(false)
+  })
+})
+
+describe("free-priority mode", () => {
+  const paidEndpoints = [
+    endpoint({ provider_name: "alpha", tag: "alpha/turbo", pricing: { prompt: "0.0000001", completion: "0.0000002" } }),
+    endpoint({ provider_name: "beta", tag: "beta/fp8", pricing: { prompt: "0.0000002", completion: "0.0000004" } }),
+    endpoint({ provider_name: "gamma", tag: "gamma/fp8", pricing: { prompt: "0.0000003", completion: "0.0000006" } }),
+  ]
+  const freeEndpoints = [
+    endpoint({ provider_name: "zero1", tag: "zero1/fp8", pricing: { prompt: "0", completion: "0" } }),
+    endpoint({ provider_name: "zero2", tag: "zero2/turbo-plus", pricing: { prompt: "0.0", completion: "0.0" } }),
+    // "mixed" offers both a free alias and a paid alias; free counts once per slug
+    endpoint({ provider_name: "mixed", tag: "mixed/fp8", pricing: { prompt: "0", completion: "0" } }),
+    endpoint({ provider_name: "mixed", tag: "mixed/premium", pricing: { prompt: "0.0000001", completion: "0.0000002" } }),
+  ]
+
+  test("keeps every free provider routable and blacklists the paid ones", () => {
+    const ranking = rankProviders([...paidEndpoints, ...freeEndpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("free")
+    // topN is ignored in free mode: 3 free slugs survive even though topN = 3 here
+    expect(ranking.survivors).toEqual(["mixed", "zero1", "zero2"])
+    expect(ranking.blacklist).toEqual(["alpha", "beta", "gamma"])
+    expect(ranking.rankings.every((rank) => rank.perRequest === 0)).toBe(true)
+  })
+
+  test("paid providers are blacklisted even when they would have been survivors", () => {
+    const ranking = rankProviders(paidEndpoints, profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("cheapest")
+    expect(ranking.survivors).toEqual(["alpha", "beta", "gamma"])
+
+    const withFree = rankProviders([paidEndpoints[0], ...freeEndpoints], profile, DEFAULT_OPTIONS)
+    expect(withFree.mode).toBe("free")
+    expect(withFree.survivors).toEqual(["mixed", "zero1", "zero2"])
+    expect(withFree.blacklist).toEqual(["alpha"])
+  })
+
+  test("free detection only counts endpoints that pass the filters", () => {
+    // The free provider's only endpoint has a 24k context: filtered out, so the plugin
+    // cannot rely on it and stays in cheapest mode.
+    const brokenFree = endpoint({
+      provider_name: "free1",
+      tag: "free1/fp8",
+      pricing: { prompt: "0", completion: "0" },
+      context_length: 24_000,
+    })
+    const ranking = rankProviders([brokenFree, ...paidEndpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("cheapest")
+    expect(ranking.survivors).toEqual(["alpha", "beta", "gamma"])
+    expect(ranking.blacklist).toEqual([])
+  })
+
+  test("preferFreeProviders=false restores the plain cost ranking", () => {
+    const options = resolveOptions({ preferFreeProviders: false })
+    const ranking = rankProviders([...paidEndpoints, ...freeEndpoints], profile, options)
+    expect(ranking.mode).toBe("cheapest")
+    // 0-cost endpoints still win the sort, but topN now caps survivors again
+    expect(ranking.survivors).toEqual(["mixed", "zero1", "zero2"])
+    expect(ranking.blacklist).toEqual(["alpha", "beta", "gamma"])
+  })
+
+  test("more free providers than topN are all kept in free mode", () => {
+    const manyFree = ["f1", "f2", "f3", "f4"].map((name) =>
+      endpoint({ provider_name: name, tag: `${name}/fp8`, pricing: { prompt: "0", completion: "0" } }),
+    )
+    const ranking = rankProviders(manyFree, profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("free")
+    expect(ranking.survivors).toEqual(["f1", "f2", "f3", "f4"])
+    expect(ranking.blacklist).toEqual([])
+  })
+})
