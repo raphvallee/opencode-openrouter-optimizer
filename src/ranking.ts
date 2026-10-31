@@ -2,7 +2,7 @@
 
 import type { OptimizerOptions } from "./config"
 import type { EndpointPricing, RequestProfile } from "./pricing"
-import { isFreePricing, requestCost, totalCost } from "./pricing"
+import { hasKnownPricing, isFreePricing, requestCost, totalCost } from "./pricing"
 
 /** Subset of GET /api/v1/models/{author}/{slug}/endpoints we care about. */
 export interface OpenRouterEndpoint {
@@ -34,9 +34,10 @@ export interface Filtered {
   reason?: string
 }
 
-/** Drop endpoints that would break OpenCode sessions or be cursed for quality. */
+/** Drop endpoints that would break OpenCode sessions, be cursed for quality, or have unknown pricing. */
 export function filterEndpoint(endpoint: OpenRouterEndpoint, options: OptimizerOptions): string | undefined {
   if (endpoint.status !== 0 && endpoint.status !== null && endpoint.status !== undefined) return "status"
+  if (!hasKnownPricing(endpoint.pricing)) return "pricing"
   const uptime = endpoint.uptime_last_30m ?? endpoint.uptime_last_1d ?? 100
   if (uptime < options.minUptimePercent) return "uptime"
   if (endpoint.context_length !== null && endpoint.context_length < options.minContextLength) return "context"

@@ -48,6 +48,12 @@ describe("filterEndpoint", () => {
     expect(filterEndpoint(endpoint({ uptime_last_30m: 80 }), DEFAULT_OPTIONS)).toBe("uptime")
   })
 
+  test("drops endpoints with missing or unparseable pricing", () => {
+    expect(filterEndpoint(endpoint({ pricing: { prompt: "", completion: "" } }), DEFAULT_OPTIONS)).toBe("pricing")
+    expect(filterEndpoint(endpoint({ pricing: { prompt: "N/A", completion: "0.0000005" } }), DEFAULT_OPTIONS)).toBe("pricing")
+    expect(filterEndpoint(endpoint({ pricing: { prompt: "0.0000001", completion: "" } }), DEFAULT_OPTIONS)).toBe("pricing")
+  })
+
   test("accepts a healthy endpoint", () => {
     expect(filterEndpoint(endpoint(), DEFAULT_OPTIONS)).toBeUndefined()
   })
@@ -116,6 +122,24 @@ describe("rankProviders", () => {
     const ranking = rankProviders(endpoints.slice(0, 2), profile, DEFAULT_OPTIONS)
     expect(ranking.survivors).toEqual(["beta", "alpha"])
     expect(ranking.blacklist).toEqual([])
+  })
+
+  test("unparseable pricing is an automatic blacklist, never free mode", () => {
+    const junk = endpoint({ provider_name: "junk", tag: "junk/fp8", pricing: { prompt: "", completion: "" } })
+    const ranking = rankProviders([junk, ...endpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("cheapest")
+    expect(ranking.survivors).toEqual(["beta", "gamma", "delta"])
+    expect(ranking.blacklist).toContain("junk")
+
+    // A junk-priced endpoint alone must not poison the mode into "free".
+    const onlyJunk = rankProviders(
+      [endpoint({ provider_name: "junk", tag: "junk/fp8", pricing: { prompt: "N/A", completion: "N/A" } })],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    expect(onlyJunk.mode).toBe("cheapest")
+    expect(onlyJunk.survivors).toEqual([])
+    expect(onlyJunk.blacklist).toEqual([])
   })
 })
 

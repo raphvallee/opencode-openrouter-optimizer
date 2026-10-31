@@ -17,8 +17,6 @@ OpenCode v2 plugin (Bun + TypeScript) that keeps OpenRouter routing cheap:
   from the second request on. Pass-through requests are inspected from a clone and are never
   re-serialized; only requests that receive a routing block are rebuilt.
 
-Details: [PLAN.md](./PLAN.md)
-
 ## Cost model
 
 ```
@@ -33,23 +31,53 @@ total      = perRequest * numRequests
 because OpenCode request shapes do not depend on the provider) and OpenRouter Activity
 rows (all clients using the OpenRouter account), treated as equals. Providers claim the
 best surviving endpoint among the aliases they expose. Endpoints without tool support,
-under 64k context, under 8k max completion tokens or under 90% uptime are excluded from
-ranking and blacklisted alongside the non-surviving providers, so the injected
-`provider.sort: "price"` cannot steer traffic to a cheap-but-broken endpoint. When no
-endpoint passes the filters, the plugin passes requests through (only `extraIgnore` is
-enforced) rather than blocking every known route.
+under 64k context, under 8k max completion tokens, under 90% uptime, or with missing or
+unparseable prices are excluded from ranking and blacklisted alongside the non-surviving
+providers, so the injected `provider.sort: "price"` cannot steer traffic to a
+cheap-but-broken endpoint. An endpoint whose prices cannot be parsed (`""`, `"N/A"`, ...)
+is treated as unknown pricing, never as free or $0. When no endpoint passes the filters,
+the plugin passes requests through (only `extraIgnore` is enforced) rather than blocking
+every known route; `provider.sort` is only injected when at least one survivor exists.
 
 ### Free-priority mode
 
 Set `preferFreeProviders: false` to disable. When a canonical (non-`:free`) model still
-has providers serving it at $0 on both input and output, the ranker switches to `free`
-mode: every free provider stays routable (the top-3 cap does not apply) and the blacklist
-is exactly the paid providers. Free status is judged only on endpoints that pass the
-filters, so one broken free alias cannot leave the session without a usable route.
+has providers serving it at $0 (input, output and cache prices all parse to zero), the
+ranker switches to `free` mode: every free provider stays routable (the top-3 cap does
+not apply) and the blacklist is exactly the paid providers. Free status is judged only
+on endpoints that pass the filters, so one broken free alias cannot leave the session
+without a usable route.
 
 ## Install
 
-Add the repo as a local plugin (object form passes options):
+Add the published package to `opencode.jsonc`:
+
+```jsonc title="opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-openrouter-optimizer"]
+}
+```
+
+Pass options in object form:
+
+```jsonc title="opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-openrouter-optimizer",
+      "options": {
+        "ttlHours": 6,
+        "topN": 3,
+        "debug": true
+      }
+    }
+  ]
+}
+```
+
+A local clone can be loaded the same way, by path:
 
 ```jsonc title="opencode.jsonc"
 {
@@ -57,11 +85,7 @@ Add the repo as a local plugin (object form passes options):
   "plugins": [
     {
       "package": "D:/t3-projects/opencode-openrouter-optimizer",
-      "options": {
-        "ttlHours": 6,
-        "topN": 3,
-        "debug": true
-      }
+      "options": { "debug": true }
     }
   ]
 }
@@ -126,8 +150,3 @@ bun test       # unit tests: pricing formula, ranking, stats merge, db round-tri
 bun run typecheck
 bun run scripts/perf-probe.ts --live   # hot-path + snapshot size probe
 ```
-
-Performance findings and the prioritized optimization plan live in
-[PERFORMANCE_AUDIT.md](./PERFORMANCE_AUDIT.md).
-
-Design notes, decisions and edge cases live in [PLAN.md](./PLAN.md).

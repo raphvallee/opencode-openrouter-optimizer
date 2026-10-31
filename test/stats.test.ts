@@ -51,6 +51,22 @@ describe("parseStatsModels", () => {
     expect(parseStatsModels("{}").size).toBe(0)
     expect(parseStatsModels('{"models": [null, {}, {"model": {"id": 5}}]}').size).toBe(0)
   })
+
+  test("rows without a usable steps count contribute no tokens", () => {
+    const profiles = parseStatsModels(
+      JSON.stringify({
+        models: [
+          // Missing steps: no request to attribute these tokens to.
+          { model: { id: "vendor/model" }, tokens: { input: 50_000, output: 1_000 } },
+          { model: { id: "vendor/model" }, steps: 1, tokens: { input: 10_000, output: 500 } },
+        ],
+      }),
+    )
+    const profile = profiles.get("vendor/model")!
+    expect(profile.requests).toBe(1)
+    expect(profile.totalInput).toBe(10_000)
+    expect(profile.totalOutput).toBe(500)
+  })
 })
 
 describe("pickProfile", () => {
@@ -185,7 +201,8 @@ describe("mergeProfile", () => {
   test("pools OpenCode and OpenRouter data as equals", () => {
     const local = { requests: 2, totalInput: 50_000, cachedInput: 10_000, totalOutput: 2_000 }
     const remote = { requests: 2, promptTokens: 30_000, completionTokens: 1_000, cachedTokens: 6_000 }
-    const profile = mergeProfile(local, remote, fallback)
+    const logs: Array<[string, Record<string, number>]> = []
+    const profile = mergeProfile(local, remote, fallback, (message, data) => logs.push([message, data]))
     expect(profile.numRequests).toBe(4)
     // (50k + 30k) / 4
     expect(profile.avgInput).toBeCloseTo(20_000)
@@ -193,6 +210,21 @@ describe("mergeProfile", () => {
     expect(profile.avgOutput).toBeCloseTo(750)
     // (10k + 6k) / (50k + 30k)
     expect(profile.cacheHitRate).toBeCloseTo(0.2)
+    // Logging is the caller's choice (debug-gated in the plugin), never unconditional.
+    expect(logs).toEqual([
+      [
+        "[openrouter-optimizer] recalculated average profile",
+        { cacheHitRate: 0.2, avgInputTokensPerRequest: 20_000, avgOutputTokensPerRequest: 750 },
+      ],
+    ])
+  })
+
+  test("each side falls back independently when it has no measured tokens", () => {
+    const profile = mergeProfile({ requests: 2, totalInput: 0, cachedInput: 0, totalOutput: 1_000 }, undefined, fallback)
+    // No input tokens measured: the input side uses the fallback instead of 0.
+    expect(profile.avgInput).toBe(20_000)
+    // Output was measured: the real average wins.
+    expect(profile.avgOutput).toBe(500)
   })
 
   test("openrouter-only data computes clean averages", () => {

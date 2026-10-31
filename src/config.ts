@@ -66,8 +66,15 @@ export const DEFAULT_OPTIONS: OptimizerOptions = {
 }
 
 function num(input: unknown, fallback: number): number {
-  const parsed = typeof input === "string" ? Number(input) : input
-  return typeof parsed === "number" && Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+  if (typeof input === "string") {
+    // "" and "  " coerce to 0 via Number(), which would silently disable filters
+    // like minContextLength; a blank string is "unset", not zero.
+    const trimmed = input.trim()
+    if (trimmed.length === 0) return fallback
+    const parsed = Number(trimmed)
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+  }
+  return typeof input === "number" && Number.isFinite(input) && input >= 0 ? input : fallback
 }
 
 function bool(input: unknown, fallback: boolean): boolean {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { effectiveRates, perRequestCost, requestCost, totalCost } from "../src/pricing"
+import { effectiveRates, hasKnownPricing, isFreePricing, perRequestCost, requestCost, totalCost } from "../src/pricing"
 
 const pricing = {
   prompt: "0.0000002", // $0.20/M
@@ -34,6 +34,13 @@ describe("effectiveRates", () => {
     expect(rates.discount).toBe(0)
     expect(rates.inputRate).toBe(0.0000002)
   })
+
+  test("discount of exactly 1 is applied, not rejected", () => {
+    const rates = effectiveRates({ ...pricing, discount: 1 })
+    expect(rates.discount).toBe(1)
+    expect(rates.inputRate).toBe(0)
+    expect(rates.outputRate).toBe(0)
+  })
 })
 
 describe("perRequestCost", () => {
@@ -64,5 +71,32 @@ describe("perRequestCost", () => {
     const { perRequest, rates } = requestCost(pricing, profile)
     expect(rates.inputRate).toBeCloseTo(0.0000002)
     expect(perRequest).toBeCloseTo(500 * 0.0000002 + 500 * 0.0000004 + 100 * 0.0000005)
+  })
+})
+
+describe("hasKnownPricing", () => {
+  test("missing or unparseable prices are unknown, not free", () => {
+    expect(hasKnownPricing({ prompt: "0.0000002", completion: "0.0000005" })).toBe(true)
+    expect(hasKnownPricing({ prompt: "0", completion: "0" })).toBe(true)
+    expect(hasKnownPricing({ prompt: "", completion: "0.0000005" })).toBe(false)
+    expect(hasKnownPricing({ prompt: "N/A", completion: "0.0000005" })).toBe(false)
+    expect(hasKnownPricing({ prompt: -1, completion: "0.0000005" })).toBe(false)
+    expect(hasKnownPricing({ completion: "0.0000005" } as never)).toBe(false)
+  })
+})
+
+describe("isFreePricing", () => {
+  test("unparseable prices are never classified as free", () => {
+    expect(isFreePricing({ prompt: "", completion: "" })).toBe(false)
+    expect(isFreePricing({ prompt: "free", completion: "0" })).toBe(false)
+    expect(isFreePricing({ prompt: "0" } as never)).toBe(false)
+  })
+
+  test("a cache-write price makes the endpoint paid even with $0 base prices", () => {
+    // The cost model bills uncached write tokens, so a positive cache-write price
+    // yields a positive perRequestCost and must not read as "free".
+    expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: "0.0000001" })).toBe(false)
+    expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: "0" })).toBe(true)
+    expect(isFreePricing({ prompt: "0", completion: "0", input_cache_read: "0.0000001" })).toBe(false)
   })
 })

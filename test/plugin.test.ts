@@ -110,6 +110,104 @@ describe("http.request hook", () => {
     }
   }, 10_000)
 
+  test("injects sort: price when every provider survives (empty blacklist)", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const realFetch = savedFetch.bind(globalThis)
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      return realFetch(input as never, init)
+    }) as typeof fetch
+
+    try {
+      // topN 4 with 4 healthy providers: all survive, blacklist is empty, but the
+      // request must still carry provider.sort = "price".
+      const { ctx, hooks } = makeCtx({ topN: 4 })
+      const plugin = definePlugin({
+        dbPath: ":memory:",
+        topN: 4,
+        statsRun: async () => JSON.stringify({ models: [] }),
+      } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      const handler = hooks.get("http.request")!.handler
+
+      let routed: { sort?: string; ignore?: string[] } | undefined
+      for (let attempt = 0; attempt < 40 && !routed; attempt++) {
+        await sleep(25)
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { sort?: string; ignore?: string[] }
+        }
+        if (parsed.provider?.sort) routed = parsed.provider
+      }
+      expect(routed?.sort).toBe("price")
+      expect(routed?.ignore).toBeUndefined()
+
+      await cleanup?.()
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
+  test("blacklists providers with unparseable pricing instead of trusting them", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const realFetch = savedFetch.bind(globalThis)
+    const junkPayload = endpointsPayload()
+    junkPayload.data.endpoints.push({
+      name: "Z | m",
+      model_id: "vendor/model",
+      context_length: 128_000,
+      max_completion_tokens: 32_768,
+      max_prompt_tokens: null,
+      pricing: { prompt: "", completion: "" },
+      provider_name: "Z",
+      tag: "zeta/fp8",
+      supported_parameters: ["tools", "tool_choice"],
+      status: 0,
+      uptime_last_30m: 100,
+    })
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(junkPayload), { status: 200 }))
+      return realFetch(input as never, init)
+    }) as typeof fetch
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({
+        dbPath: ":memory:",
+        statsRun: async () => JSON.stringify({ models: [] }),
+      } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      const handler = hooks.get("http.request")!.handler
+
+      let ignore: string[] | undefined
+      for (let attempt = 0; attempt < 40 && !ignore; attempt++) {
+        await sleep(25)
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { ignore?: string[] }
+        }
+        if (parsed.provider?.ignore && parsed.provider.ignore.length > 0) ignore = parsed.provider.ignore
+      }
+      expect(ignore).toContain("zeta")
+
+      await cleanup?.()
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
   test("debug logging names the topN providers kept when routing", async () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY

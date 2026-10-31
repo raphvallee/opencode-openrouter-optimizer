@@ -50,10 +50,14 @@ export function parseStatsModels(json: string): Map<string, LocalProfile> {
     if (!id) continue
     const tokens = row.tokens ?? {}
     const key = normalizeModelKey(id)
+    const steps = num(row.steps)
+    // A row without a usable steps count has no request to attribute tokens to;
+    // accumulating its tokens anyway would skew the per-request averages.
+    if (steps <= 0) continue
     const profile = profiles.get(key) ?? { requests: 0, totalInput: 0, cachedInput: 0, totalOutput: 0 }
     // Same best-effort semantics as before: input excludes cache buckets, so total
     // input is input + read + write; cache.read is the cached portion.
-    profile.requests += num(row.steps)
+    profile.requests += steps
     profile.totalInput += num(tokens.input) + num(tokens.cache?.read) + num(tokens.cache?.write)
     profile.cachedInput += num(tokens.cache?.read)
     profile.totalOutput += num(tokens.output) + num(tokens.reasoning)
@@ -217,6 +221,8 @@ export function mergeProfile(
   local: LocalProfile | undefined,
   openrouter: { requests: number; promptTokens: number; completionTokens: number; cachedTokens: number } | undefined,
   fallbacks: { avgInput: number; avgOutput: number; cacheHitRate: number },
+  /** Optional debug sink; the plugin passes its debug-gated logger. */
+  log?: (message: string, data: Record<string, number>) => void,
 ): RequestProfile {
   const localRequests = local?.requests ?? 0
   const remoteRequests = openrouter?.requests ?? 0
@@ -240,12 +246,22 @@ export function mergeProfile(
 
   const totalInput = localInput + remoteInput
   const totalOutput = localOutput + remoteOutput
-  const h = totalInput > 0 ? Math.min(1, Math.max(0, (localCached + remoteCached) / totalInput)) : fallbacks.cacheHitRate
+  // Both averages fall back when their side has no measured tokens: cushioning one
+  // side but not the other would collapse just the input (or output) cost estimate.
+  const avgInput = totalInput > 0 ? totalInput / requests : fallbacks.avgInput
+  const avgOutput = totalOutput > 0 ? totalOutput / requests : fallbacks.avgOutput
+  const cacheHitRate = totalInput > 0 ? Math.min(1, Math.max(0, (localCached + remoteCached) / totalInput)) : fallbacks.cacheHitRate
+
+  log?.("[openrouter-optimizer] recalculated average profile", {
+    cacheHitRate,
+    avgInputTokensPerRequest: avgInput,
+    avgOutputTokensPerRequest: avgOutput,
+  })
 
   return {
-    avgInput: totalInput / requests,
-    avgOutput: totalOutput > 0 ? totalOutput / requests : fallbacks.avgOutput,
-    cacheHitRate: h,
+    avgInput,
+    avgOutput,
+    cacheHitRate,
     numRequests: requests,
   }
 }

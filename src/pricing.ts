@@ -28,30 +28,59 @@ export interface Rates {
   discount: number
 }
 
-function parsePrice(value: string | number | null | undefined): number {
-  if (value === null || value === undefined || value === "") return 0
+/**
+ * Strict parse for required price fields (prompt, completion). Returns null when the
+ * value is absent, empty, or not a finite non-negative number ("", "N/A", -1, ...):
+ * an endpoint with unknown pricing must never be counted as free or priced at 0.
+ */
+function parseRequiredPrice(value: string | number | null | undefined): number | null {
+  if (value === null || value === undefined || value === "") return null
   const parsed = typeof value === "number" ? value : Number.parseFloat(value)
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null
+}
+
+/** Lenient parse for optional fields: missing or unparseable counts as 0. */
+function parseOptionalPrice(value: string | number | null | undefined): number {
+  return parseRequiredPrice(value) ?? 0
 }
 
 /**
- * Strictly free endpoint: zero base price on both input and output.
- * Cache/read/write prices do not matter when both required fields are free.
+ * True when prompt and completion parse to real, non-negative prices. False when
+ * either is missing or unparseable: rankProviders blacklists such endpoints instead
+ * of guessing their cost, so a corrupted price string can never pass for "free".
+ */
+export function hasKnownPricing(pricing: EndpointPricing): boolean {
+  return parseRequiredPrice(pricing.prompt) !== null && parseRequiredPrice(pricing.completion) !== null
+}
+
+/**
+ * Strictly free endpoint: zero base price on input and output, and zero cache
+ * read/write prices. The cache prices matter because the cost model bills
+ * uncached write tokens: an endpoint with a cache-write price would produce a
+ * positive perRequestCost even with $0 prompt/completion, contradicting the
+ * "free" classification used by the ranker.
  */
 export function isFreePricing(pricing: EndpointPricing): boolean {
-  return parsePrice(pricing.prompt) === 0 && parsePrice(pricing.completion) === 0
+  return (
+    parseRequiredPrice(pricing.prompt) === 0 &&
+    parseRequiredPrice(pricing.completion) === 0 &&
+    parseOptionalPrice(pricing.input_cache_read ?? pricing.prompt) === 0 &&
+    parseOptionalPrice(pricing.input_cache_write) === 0
+  )
 }
 
 export function effectiveRates(pricing: EndpointPricing): Rates {
-  const rawDiscount = parsePrice(pricing.discount ?? 0)
-  // Discounts theoretically live in [0, 1]; anything weird is treated as no discount.
-  const discount = rawDiscount > 0 && rawDiscount < 1 ? rawDiscount : 0
+  const rawDiscount = parseOptionalPrice(pricing.discount)
+  // Discounts theoretically live in [0, 1]; anything outside is treated as no discount.
+  const discount = rawDiscount > 0 && rawDiscount <= 1 ? rawDiscount : 0
   const scale = 1 - discount
   return {
-    inputRate: parsePrice(pricing.prompt) * scale,
-    outputRate: parsePrice(pricing.completion) * scale,
-    readRate: parsePrice(pricing.input_cache_read ?? pricing.prompt) * scale,
-    writeRate: parsePrice(pricing.input_cache_write ?? 0) * scale,
+    // Unparseable required prices yield 0 here, but such endpoints are blacklisted
+    // by rankProviders (hasKnownPricing) before these rates ever reach a ranking.
+    inputRate: (parseRequiredPrice(pricing.prompt) ?? 0) * scale,
+    outputRate: (parseRequiredPrice(pricing.completion) ?? 0) * scale,
+    readRate: parseOptionalPrice(pricing.input_cache_read ?? pricing.prompt) * scale,
+    writeRate: parseOptionalPrice(pricing.input_cache_write) * scale,
     discount,
   }
 }

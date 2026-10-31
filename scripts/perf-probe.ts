@@ -101,6 +101,14 @@ for (let i = 0; i < ITER; i++) db.getRankings("vendor/model")
 const rankingMs = performance.now() - start
 start = performance.now()
 for (let i = 0; i < ITER; i++) {
+  db.getFetch("vendor/model")
+  db.getRankings("vendor/model")
+}
+const readsMs = performance.now() - start
+start = performance.now()
+for (let i = 0; i < ITER; i++) {
+  // The pre-Map hot path also ran ensureFetchRow once per request, which is an
+  // INSERT OR IGNORE plus a SELECT - a write, not one of the "3 reads".
   db.ensureFetchRow("vendor/model", Date.now())
   db.getFetch("vendor/model")
   db.getRankings("vendor/model")
@@ -110,9 +118,10 @@ db.close()
 
 console.log("== sqlite hot-path cost ==")
 console.table([
-  { operation: "ensureFetchRow (1 select)", "us/call": us(ensureMs, ITER) },
+  { operation: "ensureFetchRow (insert-or-ignore + select)", "us/call": us(ensureMs, ITER) },
   { operation: "getRankings (select + JSON.parse)", "us/call": us(rankingMs, ITER) },
-  { operation: "legacy 3 reads per request", "us/call": us(combinedMs, ITER) },
+  { operation: "legacy reads per request (getFetch + getRankings)", "us/call": us(readsMs, ITER) },
+  { operation: "legacy state per request (+ ensureFetchRow)", "us/call": us(combinedMs, ITER) },
 ])
 
 // 4) New hot path: compact routing in a Map, no SQLite read and no JSON.parse per request.

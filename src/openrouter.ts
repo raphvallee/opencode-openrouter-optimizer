@@ -80,12 +80,17 @@ export async function fetchModelEndpoints(model: string, options: FetchOptions =
   }
 
   let response = await get(model)
+  // Only a missing slug (404) is worth retrying without the variant suffix. Auth,
+  // rate-limit and server errors come from the API, not the slug form: retrying
+  // them just doubles the request pressure.
   const stripped = baseModelSlug(model)
-  if (!response.ok && stripped !== model) {
+  const variantStatus = response.status
+  if (response.status === 404 && stripped !== model) {
     response = await get(stripped)
   }
   if (!response.ok) {
-    throw new OpenRouterError(`endpoints fetch failed for ${model}: HTTP ${response.status}`, response.status)
+    const detail = response.status === variantStatus ? `${response.status}` : `${variantStatus} -> ${response.status}`
+    throw new OpenRouterError(`endpoints fetch failed for ${model}: HTTP ${detail}`, response.status)
   }
   const payload = (await response.json()) as { data?: EndpointsResponse }
   const data = payload?.data

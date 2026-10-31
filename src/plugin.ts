@@ -91,7 +91,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       const routedVariantBase = new Set<string>()
       for (const state of db.loadRoutingStates(options.debug)) {
         routes.set(state.model, state)
-        if (state.routing && state.routing.blacklist.length > 0) routedVariantBase.add(baseModelSlug(state.model))
+        if (state.routing && hasInjection(state.routing)) routedVariantBase.add(baseModelSlug(state.model))
       }
 
       /** Resolve one model's state, reading the DB at most once per process. */
@@ -125,7 +125,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           avgInput: options.fallbackAvgInput,
           avgOutput: options.fallbackAvgOutput,
           cacheHitRate: options.fallbackCacheHitRate,
-        })
+        }, (message, data) => debug(message, data))
       }
 
       async function refreshModel(model: string): Promise<void> {
@@ -136,6 +136,10 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
             fetchModelEndpoints(model, { signal: controller.signal }),
             buildProfile(model),
           ])
+          // buildProfile swallows aborts (Promise.allSettled inside), so a shutdown
+          // mid-profile would otherwise persist a fallback-profile ranking as fresh
+          // for the whole TTL. A completed endpoints fetch does not make it valid.
+          if (controller.signal.aborted) return
           const ranking = rankProviders(endpoints.endpoints, profile, options)
           const now = Date.now()
           const routing: RoutingSnapshot = {
@@ -178,23 +182,31 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           if (controller.signal.aborted || isAbortError(error)) return
           const failedAt = Date.now()
           const state = routes.get(model) ?? emptyState(model)
-          state.attempts += 1
-          state.lastAttempt = failedAt
-          state.retryAfter = failedAt + backoffMs(state.attempts)
-          routes.set(model, state)
           try {
-            db.recordFailure(model, failedAt, state.retryAfter)
-            // Other processes record failures into the same row; the DB is the
-            // shared truth for the attempt count that drives backoff duration.
+            // Other processes record failures into the same row: the DB is the shared
+            // truth for the attempt count that drives backoff duration. Read it before
+            // recording, or the first failure after startup would overwrite a longer
+            // accumulated backoff with a short attempts=1 deadline.
+            let sharedAttempts = state.attempts
             const row = db.getFetch(model)
-            if (row) {
-              state.attempts = row.attempts
-              state.lastAttempt = row.last_attempt ?? failedAt
-              state.retryAfter = row.retry_after ?? state.retryAfter
+            if (row && row.attempts > sharedAttempts) sharedAttempts = row.attempts
+            const attempts = sharedAttempts + 1
+            state.attempts = attempts
+            state.lastAttempt = failedAt
+            state.retryAfter = failedAt + backoffMs(attempts)
+            db.recordFailure(model, failedAt, state.retryAfter)
+            // Another process may have recorded a failure between the read and the
+            // write; the read-back keeps the in-memory count aligned with the row.
+            const fresh = db.getFetch(model)
+            if (fresh) {
+              state.attempts = fresh.attempts
+              state.lastAttempt = fresh.last_attempt ?? failedAt
+              state.retryAfter = fresh.retry_after ?? state.retryAfter
             }
           } catch (dbError) {
             warn(`failure bookkeeping failed for ${model}:`, dbError instanceof Error ? dbError.message : dbError)
           }
+          routes.set(model, state)
           warn(`refresh failed for ${model}:`, error instanceof Error ? error.message : error)
         }
       }
@@ -214,6 +226,17 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         void task
       }
 
+      /**
+       * Whether a ranking gives the request path anything to inject: a blacklist to
+       * enforce, or (with injectSort on) a price sort backed by at least one survivor.
+       * With zero survivors there is no known-good route, so sort is never injected -
+       * it would steer OpenRouter straight to the providers the filters excluded.
+       */
+      function hasInjection(routing: RoutingSnapshot): boolean {
+        if (routing.blacklist.length > 0) return true
+        return options.injectSort && routing.survivors.length > 0
+      }
+
       /** Route one model for debug output: only evaluated when debug is enabled. */
       function logRouting(model: string, state: RoutingState | undefined): void {
         if (!options.debug) return
@@ -222,8 +245,16 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           debug(`routing ${model}: no ranking yet, passing through`)
           return
         }
+        if (routing.survivors.length === 0) {
+          debug(`routing ${model}: no endpoint passed the filters, passing through unrouted`)
+          return
+        }
         if (routing.blacklist.length === 0) {
-          debug(`routing ${model}: nothing to block, passing through`)
+          if (options.injectSort) {
+            debug(`routing ${model} (${routing.mode ?? "cheapest"}): nothing to block, injecting sort: "price"`)
+          } else {
+            debug(`routing ${model}: nothing to block, passing through`)
+          }
           return
         }
         const allowed = new Set(routing.survivors)
@@ -251,19 +282,21 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         const now = Date.now()
         const refModel = typeof evt.model?.modelID === "string" ? evt.model.modelID : ""
 
-        // Fast path: the event already names the model. If it was ranked and has no
-        // blacklist, there is nothing to inject, so the request body is never read,
-        // parsed or rebuilt.
+        // Fast path: the event already names the model. If its ranking has nothing to
+        // inject (no blacklist, and sort injection is off or unsupported), the request
+        // body is never read, parsed or rebuilt. With injectSort on, an empty blacklist
+        // still needs the provider block: composeRouting injects sort: "price".
         let state: RoutingState | undefined
         if (refModel) {
           state = stateFor(refModel, now)
           ensureFresh(state, now)
           const refRouting = state.routing
-          if (refRouting && refRouting.blacklist.length === 0) {
-            logRouting(refModel, state)
-            return
-          }
-          if (!refRouting) {
+          if (refRouting) {
+            if (!hasInjection(refRouting)) {
+              logRouting(refModel, state)
+              return
+            }
+          } else {
             logRouting(refModel, state)
             // No ranking yet. The body may name a variant of this model that carries
             // its own routing; keep inspecting for those, pass the rest through.
@@ -298,14 +331,20 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           ensureFresh(state, now)
         }
         const routing = state?.routing
-        if (!routing || routing.blacklist.length === 0) {
+        if (!routing || !hasInjection(routing)) {
           logRouting(model, state)
           return
         }
 
         logRouting(model, state)
         const mutated = body as Record<string, unknown>
-        mutated.provider = composeRouting(mutated.provider, routing.blacklist, options)
+        // Zero survivors means no known-good route: apply only the user's extraIgnore
+        // (it is explicit) and never inject sort, matching the ranking contract.
+        mutated.provider = composeRouting(
+          mutated.provider,
+          routing.blacklist,
+          routing.survivors.length > 0 ? options : { ...options, injectSort: false },
+        )
 
         const finalBody = JSON.stringify(mutated)
         const headers = new Headers(request.headers)

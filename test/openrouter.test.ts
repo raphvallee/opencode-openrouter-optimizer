@@ -43,6 +43,26 @@ describe("fetchModelEndpoints", () => {
     expect(response.id).toBe("vendor/model")
   })
 
+  test("does not retry the base slug on non-404 failures", async () => {
+    const urls: string[] = []
+    const failure = fetchModelEndpoints("vendor/model:free", {
+      fetchImpl: async (url) => {
+        urls.push(String(url))
+        return jsonResponse({ error: "rate limited" }, 429)
+      },
+    })
+    await expect(failure).rejects.toThrow("HTTP 429")
+    expect(urls).toEqual(["https://openrouter.ai/api/v1/models/vendor/model:free/endpoints"])
+  })
+
+  test("reports both statuses when the 404 retry fails differently", async () => {
+    const failure = fetchModelEndpoints("vendor/model:free", {
+      fetchImpl: async (url) =>
+        String(url).includes(":free") ? jsonResponse({ error: "not found" }, 404) : jsonResponse({ error: "boom" }, 500),
+    })
+    await expect(failure).rejects.toThrow("404 -> 500")
+  })
+
   test("throws after both attempts fail", async () => {
     const failure = fetchModelEndpoints("vendor/nonexistent", {
       fetchImpl: async () => jsonResponse({ error: "not found" }, 404),
