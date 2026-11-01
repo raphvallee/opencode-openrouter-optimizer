@@ -213,7 +213,7 @@ describe("mergeProfile", () => {
     // Logging is the caller's choice (debug-gated in the plugin), never unconditional.
     expect(logs).toEqual([
       [
-        "[openrouter-optimizer] recalculated average profile",
+        "recalculated average profile",
         { cacheHitRate: 0.2, avgInputTokensPerRequest: 20_000, avgOutputTokensPerRequest: 750 },
       ],
     ])

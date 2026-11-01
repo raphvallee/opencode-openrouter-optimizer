@@ -10,8 +10,21 @@ export interface OptimizerOptions {
   minMaxCompletionTokens: number
   minUptimePercent: number
   requireToolSupport: boolean
+  /**
+   * Endpoint filter on OpenRouter's Tool Call Error Rate (percent of tool-calling
+   * requests per provider that produced at least one invalid tool call, volume-
+   * weighted over the trailing week). Endpoints above the cap are filtered out and
+   * blacklisted like other filter failures. 100 disables the filter.
+   */
+  maxToolCallErrorRate: number
   /** Add `provider.sort: "price"` so OpenRouter picks the cheapest survivor. */
   injectSort: boolean
+  /**
+   * Max time a request waits for its first ranking. Waiting keeps the whole session on
+   * one provider's cache, so a provider switch does not pay the cache-write charge twice.
+   * A failed or slow refresh releases the request unmodified. 0 disables waiting.
+   */
+  rankingWaitMs: number
   /** Fallbacks until real stats exist for a model. */
   fallbackAvgInput: number
   fallbackAvgOutput: number
@@ -28,7 +41,7 @@ export interface OptimizerOptions {
   managementKeyEnv: string
   /**
    * Command used to read OpenCode's own usage stats (`<command> stats --json ...`).
-   * Runs only inside the background refresh task, never on the request path.
+   * Runs only inside the refresh task; a first request may wait for that task to finish.
    */
   statsCommand: string
   /** Stats window in days, aligned with the OpenRouter Activity 30-day aggregate. */
@@ -50,7 +63,9 @@ export const DEFAULT_OPTIONS: OptimizerOptions = {
   minMaxCompletionTokens: 8_000,
   minUptimePercent: 90,
   requireToolSupport: true,
+  maxToolCallErrorRate: 1,
   injectSort: true,
+  rankingWaitMs: 15_000,
   fallbackAvgInput: 20_000,
   fallbackAvgOutput: 800,
   fallbackCacheHitRate: 0.2,
@@ -98,7 +113,9 @@ export function resolveOptions(input?: unknown): OptimizerOptions {
     minMaxCompletionTokens: num(raw.minMaxCompletionTokens, DEFAULT_OPTIONS.minMaxCompletionTokens),
     minUptimePercent: num(raw.minUptimePercent, DEFAULT_OPTIONS.minUptimePercent),
     requireToolSupport: bool(raw.requireToolSupport, DEFAULT_OPTIONS.requireToolSupport),
+    maxToolCallErrorRate: Math.min(100, num(raw.maxToolCallErrorRate, DEFAULT_OPTIONS.maxToolCallErrorRate)),
     injectSort: bool(raw.injectSort, DEFAULT_OPTIONS.injectSort),
+    rankingWaitMs: num(raw.rankingWaitMs, DEFAULT_OPTIONS.rankingWaitMs),
     fallbackAvgInput: num(raw.fallbackAvgInput, DEFAULT_OPTIONS.fallbackAvgInput),
     fallbackAvgOutput: num(raw.fallbackAvgOutput, DEFAULT_OPTIONS.fallbackAvgOutput),
     fallbackCacheHitRate: Math.min(1, num(raw.fallbackCacheHitRate, DEFAULT_OPTIONS.fallbackCacheHitRate)),

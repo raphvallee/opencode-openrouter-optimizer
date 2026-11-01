@@ -8,8 +8,9 @@
  *     "tokens": { "input": ..., "output": ..., "reasoning": ..., "cache": { "read": ..., "write": ... } } }
  *
  * Variants of the same base slug are summed into one profile. The stats process only
- * ever runs inside the background refresh task: the request path reads precomputed
- * rankings from the DB and never waits on it.
+ * ever runs inside the refresh task: the request path reads precomputed rankings, and a
+ * first request with no ranking yet waits for that refresh so the session keeps one
+ * provider's cache.
  */
 
 import { normalizeModelKey } from "./db"
@@ -252,7 +253,7 @@ export function mergeProfile(
   const avgOutput = totalOutput > 0 ? totalOutput / requests : fallbacks.avgOutput
   const cacheHitRate = totalInput > 0 ? Math.min(1, Math.max(0, (localCached + remoteCached) / totalInput)) : fallbacks.cacheHitRate
 
-  log?.("[openrouter-optimizer] recalculated average profile", {
+  log?.("recalculated average profile", {
     cacheHitRate,
     avgInputTokensPerRequest: avgInput,
     avgOutputTokensPerRequest: avgOutput,

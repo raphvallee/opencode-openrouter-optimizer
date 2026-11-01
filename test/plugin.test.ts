@@ -46,12 +46,26 @@ function makeCtx(options = {}) {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+/**
+ * Wrap a fetch mock so the plugin's optional Tool Call Error Rate probe (frontend stats
+ * routes) never reaches the real network. Empty rows leave the ranking unchanged.
+ */
+function withStatsFallback(fetchImpl: typeof fetch): typeof fetch {
+  return ((input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+    if (url.includes("/api/frontend/v1/stats/")) {
+      return Promise.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 }))
+    }
+    return fetchImpl(input as never, init)
+  }) as typeof fetch
+}
+
 describe("http.request hook", () => {
-  test("first request passes through, next requests carry the blacklist", async () => {
+  test("first request waits for the ranking and already carries the blacklist", async () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY
     const savedFetch = globalThis.fetch
-    const realFetch = savedFetch.bind(globalThis)
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
     globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
       if (url === ENDPOINTS_URL && (init?.signal as AbortSignal | undefined)?.aborted !== true) {
@@ -71,24 +85,25 @@ describe("http.request hook", () => {
 
       const handler = hooks.get("http.request")!.handler
 
-      // Request 1: never-fetched model, must go out unmodified (no config yet) while the
-      // background refresh computes prices.
+      // Request 1: never-fetched model. It must wait for the ranking instead of going out
+      // unrouted, so the session does not switch providers after the first prompt and pay
+      // the cache-write charge twice.
       const evt1 = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
       await handler(evt1)
-      const body1 = await (evt1 as { request: Request }).request.text()
-      expect(JSON.parse(body1)?.provider).toBeUndefined()
-
-      // Wait for the background ranking, then assert request 2 carries ignore + sort.
-      let seen: { ignore: string[]; sort?: string } | undefined
-      for (let attempt = 0; attempt < 40 && !seen; attempt++) {
-        await sleep(25)
-        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
-        await handler(evt)
-        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as { provider?: { ignore?: string[]; sort?: string } }
-        if (parsed.provider?.ignore && parsed.provider.ignore.length > 0) seen = { ignore: parsed.provider.ignore, sort: parsed.provider.sort }
+      const parsed1 = JSON.parse(await (evt1 as { request: Request }).request.text()) as {
+        provider?: { ignore?: string[]; sort?: string }
       }
-      expect(seen?.ignore).toEqual(["epsilon"])
-      expect(seen?.sort).toBe("price")
+      expect(parsed1.provider?.ignore).toEqual(["epsilon"])
+      expect(parsed1.provider?.sort).toBe("price")
+
+      // The ranking is cached now: the next request routes without waiting on a refresh.
+      const evt2 = { request: openRouterRequest(), model: { providerID: "openrouter", modelID: "vendor/model" }, kind: "primary" }
+      await handler(evt2)
+      const parsed2 = JSON.parse(await (evt2 as { request: Request }).request.text()) as {
+        provider?: { ignore?: string[]; sort?: string }
+      }
+      expect(parsed2.provider?.ignore).toEqual(["epsilon"])
+      expect(parsed2.provider?.sort).toBe("price")
 
       // Non-OpenRouter providers are untouched.
       const evt3 = {
@@ -114,7 +129,7 @@ describe("http.request hook", () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY
     const savedFetch = globalThis.fetch
-    const realFetch = savedFetch.bind(globalThis)
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
     globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
       if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
@@ -158,7 +173,7 @@ describe("http.request hook", () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY
     const savedFetch = globalThis.fetch
-    const realFetch = savedFetch.bind(globalThis)
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
     const junkPayload = endpointsPayload()
     junkPayload.data.endpoints.push({
       name: "Z | m",
@@ -212,7 +227,7 @@ describe("http.request hook", () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY
     const savedFetch = globalThis.fetch
-    const realFetch = savedFetch.bind(globalThis)
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
     globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
       if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
@@ -291,7 +306,7 @@ describe("hot path", () => {
 
   test("uses the event model ref and leaves the body untouched when no blacklist exists", async () => {
     const savedFetch = globalThis.fetch
-    const realFetch = savedFetch.bind(globalThis)
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
     globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
       if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
@@ -302,11 +317,21 @@ describe("hot path", () => {
       const { ctx, hooks } = makeCtx({})
       const plugin = definePlugin({
         dbPath: ":memory:",
+        topN: 4,
+        injectSort: false,
         statsRun: async () => JSON.stringify({ models: [] }),
       } as never)
       const cleanup = await plugin.setup!(ctx as never)
       const handler = hooks.get("http.request")!.handler
 
+      // First request: no ranking yet. It waits for the refresh and reads the body to
+      // learn which model to rank. With all four providers surviving and sort injection
+      // off, there is nothing to inject, so the request goes out unmodified.
+      const evt1 = { request: openRouterRequest(), model: { providerID: "openrouter", modelID: "vendor/model" }, kind: "primary" }
+      await handler(evt1)
+      expect(JSON.parse(await (evt1 as { request: Request }).request.text()).provider).toBeUndefined()
+
+      // Ranking is cached now. The event ref fast path must not clone, parse or rebuild.
       const req = openRouterRequest()
       const originalClone = req.clone
       let clones = 0
@@ -317,25 +342,63 @@ describe("hot path", () => {
         },
       })
 
-      const evt = { request: req, model: { providerID: "openrouter", modelID: "vendor/model" }, kind: "primary" }
-      await handler(evt)
+      const evt2 = { request: req, model: { providerID: "openrouter", modelID: "vendor/model" }, kind: "primary" }
+      await handler(evt2)
 
-      // No ranking yet: the body must not be read, cloned or rebuilt.
       expect(clones).toBe(0)
-      expect(JSON.parse(await (evt as { request: Request }).request.text()).model).toBe("vendor/model")
+      expect(JSON.parse(await (evt2 as { request: Request }).request.text()).model).toBe("vendor/model")
 
-      await sleep(20)
       await cleanup?.()
     } finally {
       globalThis.fetch = savedFetch
     }
   })
 
+  test("a slow first refresh times out and the request passes through unmodified", async () => {
+    const savedFetch = globalThis.fetch
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
+    let refreshFinished = false
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) {
+        // Deliberately slower than rankingWaitMs: the request must not wait for it.
+        return new Promise<Response>((resolve) => {
+          setTimeout(() => {
+            refreshFinished = true
+            resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+          }, 200)
+        })
+      }
+      return realFetch(input as never, init)
+    }) as typeof fetch
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({
+        dbPath: ":memory:",
+        rankingWaitMs: 20,
+        statsRun: async () => JSON.stringify({ models: [] }),
+      } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      const handler = hooks.get("http.request")!.handler
+
+      const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+      await handler(evt)
+      // The wait is bounded: the request is released while the refresh is still running.
+      expect(refreshFinished).toBe(false)
+      expect(JSON.parse(await (evt as { request: Request }).request.text()).provider).toBeUndefined()
+
+      await cleanup?.()
+    } finally {
+      globalThis.fetch = savedFetch
+    }
+  }, 10_000)
+
   test("does not retry a failed refresh on the next request (backoff)", async () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY
     const savedFetch = globalThis.fetch
-    const realFetch = savedFetch.bind(globalThis)
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
     let endpointCalls = 0
     globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url

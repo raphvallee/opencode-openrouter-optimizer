@@ -12,10 +12,13 @@ OpenCode v2 plugin (Bun + TypeScript) that keeps OpenRouter routing cheap:
   the background refresh task with a cached single-flight snapshot), ranks providers,
   keeps the 3 cheapest and blacklists the rest by injecting `provider.ignore`
   (plus `provider.sort: "price"`) into every request.
-- Never delays a request on network work: the 6h TTL refresh runs in the background, results
-  are used by the next request. A model seen for the first time passes through once, routed
-  from the second request on. Pass-through requests are inspected from a clone and are never
-  re-serialized; only requests that receive a routing block are rebuilt.
+- A model seen for the first time waits for its ranking before the request is sent, so the
+  first prompt already goes to the provider the session will keep using. Switching after
+  the fact would pay a cache-write charge twice on providers that bill for cache writes.
+  Later requests use the in-memory snapshot; the 6h TTL refresh runs in the background and
+  applies to the next request. A refresh that fails or exceeds `rankingWaitMs` releases the
+  request unmodified instead of hanging it. Pass-through requests are inspected from a clone
+  and are never re-serialized; only requests that receive a routing block are rebuilt.
 
 ## Cost model
 
@@ -105,8 +108,10 @@ usage and the fallback profile until real data accumulates.
 | `minContextLength` | `64000` | Endpoint context filter |
 | `minMaxCompletionTokens` | `8000` | Endpoint output-cap filter (3072-token style providers are excluded) |
 | `minUptimePercent` | `90` | Endpoint uptime filter |
+| `maxToolCallErrorRate` | `1` | Provider Tool Call Error Rate cap in percent; providers above it are filtered out and blacklisted. `100` disables |
 | `requireToolSupport` | `true` | Require `tools`+`tool_choice` params |
 | `injectSort` | `true` | Add `provider.sort: "price"` |
+| `rankingWaitMs` | `15000` | Max time a first request waits for its initial ranking; `0` disables waiting (pass through immediately) |
 | `fallbackAvgInput` / `fallbackAvgOutput` / `fallbackCacheHitRate` | `20000` / `800` / `0.2` | Fallback profile until stats exist |
 | `preferFreeProviders` | `true` | $0 providers ("free mode") always stay routable; paid providers get blacklisted |
 | `extraIgnore` | `[]` | Provider slugs always blacklisted |

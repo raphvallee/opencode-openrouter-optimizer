@@ -1,10 +1,10 @@
-/** Wiring: http.request interception, background refresh, stats collection. */
+/** Wiring: http.request interception, refresh (awaited on first sight), stats collection. */
 
 import { Plugin } from "@opencode/plugin"
 import { DEFAULT_OPTIONS, resolveOptions, type OptimizerOptions } from "./config"
 import { OptimizerDb, routingStateFromRow, type RoutingSnapshot, type RoutingState } from "./db"
-import { fetchModelEndpoints, fetchOpenRouterProfile, baseModelSlug } from "./openrouter"
-import { composeRouting, rankProviders, type ProviderRank } from "./ranking"
+import { fetchModelEndpoints, fetchOpenRouterProfile, fetchToolCallErrorRate, permaslugFromEndpoints } from "./openrouter"
+import { composeRouting, providerSlug, rankProviders, type ProviderRank } from "./ranking"
 import { mergeProfile, OpenCodeStats, type LocalProfile } from "./stats"
 
 interface HttpEventLike {
@@ -36,6 +36,27 @@ function emptyState(model: string): RoutingState {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError"
+}
+
+/**
+ * Resolve when the task settles or when the wait budget runs out. Never rejects:
+ * a refresh failure must fail open (request passes through) instead of failing it.
+ */
+function waitForTask(task: Promise<void>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = () => {
+      if (settled) return
+      settled = true
+      if (timer !== undefined) clearTimeout(timer)
+      resolve()
+    }
+    timer = setTimeout(finish, Math.max(0, ms))
+    // Never keep the process alive just to expire a wait cap.
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    task.then(finish, finish)
+  })
 }
 
 export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
@@ -86,12 +107,8 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       // The DB stays durable; another process may refresh behind us, which is bounded
       // by the same TTL the routing decisions already use.
       const routes = new Map<string, RoutingState>()
-      // Bases of models whose stored routing came in under a variant key: when the
-      // event ref has no ranking of its own, the request body may name such a variant.
-      const routedVariantBase = new Set<string>()
       for (const state of db.loadRoutingStates(options.debug)) {
         routes.set(state.model, state)
-        if (state.routing && hasInjection(state.routing)) routedVariantBase.add(baseModelSlug(state.model))
       }
 
       /** Resolve one model's state, reading the DB at most once per process. */
@@ -140,6 +157,30 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           // mid-profile would otherwise persist a fallback-profile ranking as fresh
           // for the whole TTL. A completed endpoints fetch does not make it valid.
           if (controller.signal.aborted) return
+
+          // Tool Call Error Rate: optional data, fetched only when the filter is on.
+          // Failures are swallowed: ranking proceeds without the filter instead of
+          // blocking every provider on a flaky stats route. The permaslug comes from
+          // the endpoints payload itself (its name tails), so no extra resolution
+          // request is needed.
+          if (options.maxToolCallErrorRate < 100) {
+            const permaslug = permaslugFromEndpoints(endpoints.endpoints)
+            if (permaslug) {
+              try {
+                const rates = await fetchToolCallErrorRate(permaslug, {
+                  signal: controller.signal,
+                  timeRange: "1w",
+                })
+                for (const endpoint of endpoints.endpoints) {
+                  endpoint.toolCallErrorRate = rates.get(providerSlug(endpoint))
+                }
+              } catch (error) {
+                if (isAbortError(error)) throw error
+                debug("tool call error rate unavailable, ranking without it:", error)
+              }
+            }
+          }
+
           const ranking = rankProviders(endpoints.endpoints, profile, options)
           const now = Date.now()
           const routing: RoutingSnapshot = {
@@ -159,8 +200,6 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           state.routing = routing
           if (options.debug) state.details = ranking.rankings
           routes.set(model, state)
-          // Track routed bases so variant-suffixed request bodies can find their
-          // routing even when the event ref itself has no ranking yet.
           if (routing.survivors.length === 0 && routing.blacklist.length === 0) {
             // Nothing is enforced and requests pass through unrouted; make that
             // visible once per model per process instead of debug-only.
@@ -168,8 +207,6 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
               unroutedWarned.add(model)
               warn(`${model}: no endpoint passed the filters, requests pass through unrouted`)
             }
-          } else {
-            routedVariantBase.add(baseModelSlug(model))
           }
 
           debug(
@@ -211,19 +248,41 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         }
       }
 
-      /** Lazy, never-blocking refresh trigger. Single-flight per model, with backoff. */
-      function ensureFresh(state: RoutingState, now: number): void {
+      /**
+       * Start or join the refresh for a model. Returns the in-flight task so a request
+       * with no ranking yet can wait for it. Undefined means no refresh was started:
+       * the ranking is fresh enough or the model is backing off after a failure.
+       */
+      function ensureFresh(state: RoutingState, now: number, force = false): Promise<void> | undefined {
         const model = state.model
-        if (inflight.has(model)) return
-        const fresh = state.lastFetched !== null && now - state.lastFetched <= ttlMs
-        if (fresh) return
-        if (state.retryAfter !== null && now < state.retryAfter) return
+        const running = inflight.get(model)
+        if (running) return running
+        const fresh = !force && state.lastFetched !== null && now - state.lastFetched <= ttlMs
+        if (fresh) return undefined
+        if (state.retryAfter !== null && now < state.retryAfter) return undefined
         const task = refreshModel(model).finally(() => inflight.delete(model))
         // refreshModel handles its own errors, but its failure bookkeeping can still
         // reject (locked/closed DB): never leave an unhandled rejection behind.
         task.catch(() => {})
         inflight.set(model, task)
-        void task
+        return task
+      }
+
+      /**
+       * Wait for a model's first ranking. Sending the first prompt through an arbitrary
+       * provider and switching after the ranking arrives would pay that provider's
+       * cache-write charge twice. Fails open: a failed or slow refresh releases the
+       * request unmodified instead of hanging it.
+       */
+      async function awaitRanking(state: RoutingState, now: number): Promise<RoutingState> {
+        if (state.routing) return state
+        const task = ensureFresh(state, now, true)
+        if (!task) return routes.get(state.model) ?? state
+        // 0 means "do not wait": the refresh still runs in the background, but this
+        // request goes out immediately.
+        if (options.rankingWaitMs <= 0) return routes.get(state.model) ?? state
+        await waitForTask(task, options.rankingWaitMs)
+        return routes.get(state.model) ?? state
       }
 
       /**
@@ -289,19 +348,15 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         let state: RoutingState | undefined
         if (refModel) {
           state = stateFor(refModel, now)
-          ensureFresh(state, now)
-          const refRouting = state.routing
-          if (refRouting) {
-            if (!hasInjection(refRouting)) {
+          if (state.routing) {
+            ensureFresh(state, now)
+            if (!hasInjection(state.routing)) {
               logRouting(refModel, state)
               return
             }
-          } else {
-            logRouting(refModel, state)
-            // No ranking yet. The body may name a variant of this model that carries
-            // its own routing; keep inspecting for those, pass the rest through.
-            if (!routedVariantBase.has(baseModelSlug(refModel))) return
           }
+          // No ranking yet: read the body first. It may name a variant with its own
+          // ranking, and it decides which model actually needs to be ranked.
         }
 
         // The body is a one-shot stream. Inspect a clone so an untouched request keeps
@@ -328,7 +383,13 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
 
         if (model !== refModel) {
           state = stateFor(model, now)
-          ensureFresh(state, now)
+          if (state.routing) ensureFresh(state, now)
+          else state = await awaitRanking(state, now)
+        } else if (state && !state.routing) {
+          // The event ref had no ranking and the body names the same model: wait for the
+          // first ranking before sending, so the session keeps one provider's cache and
+          // does not pay the cache-write charge twice after a provider switch.
+          state = await awaitRanking(state, now)
         }
         const routing = state?.routing
         if (!routing || !hasInjection(routing)) {
@@ -365,7 +426,8 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       await ctx.session.hook("http.request", async (event) => {
         const evt = event as unknown as HttpEventLike
         // Any hook error is caught and the request continues unmodified: a DB hiccup
-        // (SQLITE_BUSY, closed DB) must never fail or stall a user request.
+        // (SQLITE_BUSY, closed DB) must never fail a user request. First-sight waits are
+        // bounded by rankingWaitMs and fail open on their own.
         try {
           await routeRequest(evt)
         } catch (error) {

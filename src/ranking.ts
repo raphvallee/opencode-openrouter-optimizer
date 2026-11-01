@@ -19,6 +19,12 @@ export interface OpenRouterEndpoint {
   uptime_last_30m: number | null
   uptime_last_1d: number | null
   quantization?: string | null
+  /**
+   * Provider-level Tool Call Error Rate (percent, 0-100), attached by the refresh
+   * task from OpenRouter's Performance-tab stats. Undefined when OpenRouter has no
+   * tool-call data for the provider: no evidence, no filtering.
+   */
+  toolCallErrorRate?: number
 }
 
 /** Provider slug is the tag prefix, e.g. "deepinfra" for "deepinfra/turbo". */
@@ -40,6 +46,9 @@ export function filterEndpoint(endpoint: OpenRouterEndpoint, options: OptimizerO
   if (!hasKnownPricing(endpoint.pricing)) return "pricing"
   const uptime = endpoint.uptime_last_30m ?? endpoint.uptime_last_1d ?? 100
   if (uptime < options.minUptimePercent) return "uptime"
+  if (endpoint.toolCallErrorRate !== undefined && endpoint.toolCallErrorRate > options.maxToolCallErrorRate) {
+    return "tool-errors"
+  }
   if (endpoint.context_length !== null && endpoint.context_length < options.minContextLength) return "context"
   if (
     endpoint.max_completion_tokens !== null &&
