@@ -48,6 +48,12 @@ survivor exists.
 
 ### Context-tiered pricing
 
+Why this exists: most recent OpenAI models (GPT-6 Luna, GPT-6.1 Terra/Sol, and similar
+releases) no longer have a single flat price. They charge one rate for normal requests
+and a higher rate once the prompt crosses a context threshold, so a cost estimate built
+from only the base rates would look much cheaper than what a long-context session
+actually pays. The plugin applies whichever tier matches the session's context size.
+
 Some endpoints charge more above a prompt-token threshold (for example GPT-6 Luna's
 long-context tier). OpenRouter reports those tiers in `pricing.overrides`: an entry with
 `min_prompt_tokens` applies when a request's prompt tokens are strictly greater than the

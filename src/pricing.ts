@@ -15,7 +15,10 @@
  *
  * Some endpoints price long context differently: pricing.overrides carries conditional
  * entries, and a tiered entry applies when the request's prompt tokens are strictly
- * greater than its min_prompt_tokens threshold. Per OpenRouter's contract, later
+ * greater than its min_prompt_tokens threshold. This matters because most recent OpenAI
+ * models (GPT-6 Luna and similar) charge a higher rate once the prompt crosses a context
+ * threshold, so base rates alone would understate a long-context session's cost.
+ * Per OpenRouter's contract, later
  * applicable entries win per price key and keys an entry leaves out inherit the base
  * price. The cost model sees the workload through the profile, so the profile's
  * avgInput plays the role of the request's prompt size: a tier applies when avgInput is
