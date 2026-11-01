@@ -28,6 +28,7 @@ export interface FetchRow {
   mode: string | null
   computed_at: number | null
   details_json: string | null
+  blacklist_reasons_json: string | null
   updated_at: number
 }
 
@@ -42,6 +43,7 @@ export interface RoutingSnapshot {
 /** Full snapshot used by tests, inspection and debug logging. */
 export interface RankingSnapshot extends RoutingSnapshot {
   rankings: unknown[]
+  blacklistReasons?: Record<string, string[]>
 }
 
 /** In-memory state for one model: fetch bookkeeping plus the compact routing. */
@@ -53,6 +55,7 @@ export interface RoutingState {
   retryAfter: number | null
   routing?: RoutingSnapshot
   details?: unknown[]
+  blacklistReasons?: Record<string, string[]>
 }
 
 const SCHEMA = `
@@ -67,6 +70,7 @@ const SCHEMA = `
     mode TEXT,
     computed_at INTEGER,
     details_json TEXT,
+    blacklist_reasons_json TEXT,
     updated_at INTEGER
   );
 `
@@ -80,10 +84,11 @@ const MIGRATION_COLUMNS: Array<[string, string]> = [
   ["mode", "TEXT"],
   ["computed_at", "INTEGER"],
   ["details_json", "TEXT"],
+  ["blacklist_reasons_json", "TEXT"],
 ]
 
 const SELECT_COLUMNS = `model, last_fetched, last_attempt, attempts, retry_after,
-  survivors_json, blacklist_json, mode, computed_at, details_json, updated_at`
+  survivors_json, blacklist_json, mode, computed_at, details_json, blacklist_reasons_json, updated_at`
 
 const SELECT_COLUMNS_LEAN = `model, last_fetched, last_attempt, attempts, retry_after,
   survivors_json, blacklist_json, mode, computed_at, updated_at`
@@ -138,6 +143,28 @@ function parseDetails(json: string | null): unknown[] | undefined {
   }
 }
 
+/**
+ * slug -> why it was blacklisted (one entry per cause). Debug-only payload: a
+ * malformed value just means no reasons are shown, never a routing change.
+ */
+function parseBlacklistReasons(json: string | null): Record<string, string[]> | undefined {
+  if (!json) return undefined
+  try {
+    const parsed: unknown = JSON.parse(json)
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined
+    const out: Record<string, string[]> = {}
+    for (const [slug, reasons] of Object.entries(parsed)) {
+      if (slug.length === 0 || !Array.isArray(reasons) || reasons.some((r) => typeof r !== "string")) {
+        return undefined
+      }
+      out[slug] = reasons as string[]
+    }
+    return out
+  } catch {
+    return undefined
+  }
+}
+
 function modeOf(value: string | null): "free" | "cheapest" {
   return value === "free" ? "free" : "cheapest"
 }
@@ -163,6 +190,7 @@ export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingS
     retryAfter: row.retry_after,
     routing,
     details: withDetails ? parseDetails(row.details_json) : undefined,
+    blacklistReasons: withDetails ? parseBlacklistReasons(row.blacklist_reasons_json) : undefined,
   }
 }
 
@@ -293,8 +321,8 @@ export class OptimizerDb {
     this.saveRefreshStmt = this.db.prepare(`
       INSERT INTO fetches
         (model, last_fetched, last_attempt, attempts, retry_after,
-         survivors_json, blacklist_json, mode, computed_at, details_json, updated_at)
-      VALUES (?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?)
+         survivors_json, blacklist_json, mode, computed_at, details_json, blacklist_reasons_json, updated_at)
+      VALUES (?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(model) DO UPDATE SET
         last_fetched = excluded.last_fetched,
         last_attempt = excluded.last_attempt,
@@ -305,6 +333,7 @@ export class OptimizerDb {
         mode = excluded.mode,
         computed_at = excluded.computed_at,
         details_json = excluded.details_json,
+        blacklist_reasons_json = excluded.blacklist_reasons_json,
         updated_at = excluded.updated_at
     `)
     this.recordFailureStmt = this.db.prepare(`
@@ -317,14 +346,15 @@ export class OptimizerDb {
         updated_at = excluded.updated_at
     `)
     this.upsertRanking = this.db.prepare(`
-      INSERT INTO fetches (model, survivors_json, blacklist_json, mode, computed_at, details_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO fetches (model, survivors_json, blacklist_json, mode, computed_at, details_json, blacklist_reasons_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(model) DO UPDATE SET
         survivors_json = excluded.survivors_json,
         blacklist_json = excluded.blacklist_json,
         mode = excluded.mode,
         computed_at = excluded.computed_at,
         details_json = excluded.details_json,
+        blacklist_reasons_json = excluded.blacklist_reasons_json,
         updated_at = excluded.updated_at
     `)
   }
@@ -360,7 +390,13 @@ export class OptimizerDb {
   }
 
   /** Persist one successful refresh in a single UPSERT (QW-8). */
-  saveRefresh(model: string, routing: RoutingSnapshot, now: number, details?: unknown[]): void {
+  saveRefresh(
+    model: string,
+    routing: RoutingSnapshot,
+    now: number,
+    details?: unknown[],
+    blacklistReasons?: Record<string, string[]>,
+  ): void {
     this.assertOpen()
     this.saveRefreshStmt.run(
       model,
@@ -371,6 +407,7 @@ export class OptimizerDb {
       routing.mode ?? "cheapest",
       routing.computedAt,
       details && details.length > 0 ? JSON.stringify(details) : null,
+      blacklistReasons && Object.keys(blacklistReasons).length > 0 ? JSON.stringify(blacklistReasons) : null,
       now,
     )
   }
@@ -392,7 +429,7 @@ export class OptimizerDb {
     if (!row) return undefined
     const state = routingStateFromRow(row)
     if (!state.routing) return undefined
-    return { ...state.routing, rankings: state.details ?? [] }
+    return { ...state.routing, rankings: state.details ?? [], blacklistReasons: state.blacklistReasons }
   }
 
   /** Rankings write used by tests and tooling; the plugin uses saveRefresh. */
@@ -404,6 +441,9 @@ export class OptimizerDb {
       ranking.mode ?? "cheapest",
       ranking.computedAt,
       ranking.rankings.length > 0 ? JSON.stringify(ranking.rankings) : null,
+      ranking.blacklistReasons && Object.keys(ranking.blacklistReasons).length > 0
+        ? JSON.stringify(ranking.blacklistReasons)
+        : null,
       Date.now(),
     )
   }

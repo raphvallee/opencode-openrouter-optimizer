@@ -59,6 +59,11 @@ export interface OptimizerOptions {
   dbPath?: string
   /** Verbose logging. */
   debug: boolean
+  /**
+   * With debug on, also log why every provider in the blacklist was blocked
+   * (filter failures, price rank, free mode, extraIgnore). Requires debug.
+   */
+  debugBlacklistReasons: boolean
 }
 
 export const DEFAULT_OPTIONS: OptimizerOptions = {
@@ -84,6 +89,7 @@ export const DEFAULT_OPTIONS: OptimizerOptions = {
   statsRun: undefined,
   dbPath: undefined,
   debug: false,
+  debugBlacklistReasons: false,
 }
 
 const OPTION_KEYS: ReadonlyArray<keyof OptimizerOptions> = [
@@ -109,6 +115,7 @@ const OPTION_KEYS: ReadonlyArray<keyof OptimizerOptions> = [
   "statsRun",
   "dbPath",
   "debug",
+  "debugBlacklistReasons",
 ]
 
 const VALID_KEYS = new Set<string>(OPTION_KEYS)
@@ -269,5 +276,6 @@ export function resolveOptions(input?: unknown): OptimizerOptions {
     statsRun: optionalFunctionOption(raw, "statsRun"),
     dbPath: optionalStringOption(raw, "dbPath"),
     debug: booleanOption(raw, "debug", DEFAULT_OPTIONS.debug),
+    debugBlacklistReasons: booleanOption(raw, "debugBlacklistReasons", DEFAULT_OPTIONS.debugBlacklistReasons),
   }
 }

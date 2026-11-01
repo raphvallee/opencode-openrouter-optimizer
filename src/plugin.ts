@@ -305,8 +305,14 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
             computedAt: ranking.computedAt,
             mode: ranking.mode,
           }
-          // One write per refresh. Full rankings are debug-only payload.
-          db.saveRefresh(model, routing, now, options.debug ? ranking.rankings : undefined)
+          // One write per refresh. Full rankings and blacklist reasons are debug-only payload.
+          db.saveRefresh(
+            model,
+            routing,
+            now,
+            options.debug ? ranking.rankings : undefined,
+            options.debugBlacklistReasons ? ranking.blacklistReasons : undefined,
+          )
 
           const state = routes.get(model) ?? emptyState(model)
           state.lastFetched = now
@@ -315,6 +321,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           state.retryAfter = null
           state.routing = routing
           if (options.debug) state.details = ranking.rankings
+          if (options.debugBlacklistReasons) state.blacklistReasons = ranking.blacklistReasons
           routes.set(model, state)
           if (routing.survivors.length === 0 && routing.blacklist.length === 0) {
             // Nothing is enforced and requests pass through unrouted; make that
@@ -443,6 +450,16 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           `routing ${model} (${routing.mode ?? "cheapest"}): keeping ${selected.length} = [${selected.join(", ")}]`,
           `blocking ${routing.blacklist.length}`,
         )
+        // Per-provider block reasons, only with debugBlacklistReasons. Reasons follow the
+        // blacklist order; a slug without recorded reasons is called out explicitly.
+        if (options.debugBlacklistReasons) {
+          const reasons = state?.blacklistReasons
+          const described = routing.blacklist.map((slug) => {
+            const list = reasons?.[slug]
+            return list && list.length > 0 ? `${slug} (${list.join(", ")})` : `${slug} (?)`
+          })
+          debug(`blocking reasons: ${described.join("; ")}`)
+        }
       }
 
       /** The full routing pass for one request; throws bubble to the hook guard below. */

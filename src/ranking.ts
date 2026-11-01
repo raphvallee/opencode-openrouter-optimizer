@@ -79,6 +79,11 @@ export interface Ranking {
   rankings: ProviderRank[]
   survivors: string[]
   blacklist: string[]
+  /**
+   * slug -> reasons it was blacklisted (all of them, one entry per cause), only
+   * built when options.debugBlacklistReasons is on: debug-only payload.
+   */
+  blacklistReasons?: Record<string, string[]>
   profile: RequestProfile
   computedAt: number
 }
@@ -106,6 +111,16 @@ export function rankProviders(
 ): Ranking {
   const now = Date.now()
 
+  // Blacklist reasons are debug-only payload: built exclusively when the option is
+  // on, so the hot path stays clean when debugBlacklistReasons is off.
+  const reasonMap = options.debugBlacklistReasons ? new Map<string, Set<string>>() : undefined
+  const addReason = (slug: string, reason: string) => {
+    if (!reasonMap) return
+    const existing = reasonMap.get(slug)
+    if (existing) existing.add(reason)
+    else reasonMap.set(slug, new Set([reason]))
+  }
+
   // 1) Endpoint filters: only surviving endpoints can claim "free" or be ranked.
   //    Filtered slugs are remembered: they are known providers and enforceable.
   const eligible: Array<{ endpoint: OpenRouterEndpoint; slug: string }> = []
@@ -113,8 +128,10 @@ export function rankProviders(
   for (const endpoint of endpoints) {
     const slug = providerSlug(endpoint)
     if (!slug) continue
-    if (filterEndpoint(endpoint, options) !== undefined) {
+    const filterReason = filterEndpoint(endpoint, options)
+    if (filterReason !== undefined) {
       filteredSlugs.add(slug)
+      addReason(slug, filterReason)
       continue
     }
     eligible.push({ endpoint, slug })
@@ -170,11 +187,32 @@ export function rankProviders(
         ].filter((slug) => !survivorSet.has(slug))),
       ]
 
+  let blacklistReasons: Record<string, string[]> | undefined
+  if (reasonMap) {
+    // Ranked-but-not-surviving slugs are blocked by price (topN in cheapest mode,
+    // paid-in-free-mode otherwise); extraIgnore is the user's explicit instruction.
+    const priceReason = freeMode ? "paid" : "not-cheapest"
+    for (const { slug } of eligible) {
+      if (!survivorSet.has(slug)) addReason(slug, priceReason)
+    }
+    for (const slug of options.extraIgnore) {
+      addReason(slug, "extra-ignore")
+    }
+    // Keep the blacklist's order and only include slugs that are actually blocked:
+    // a slug can carry filter + price + extraIgnore reasons at once.
+    blacklistReasons = {}
+    for (const slug of blacklist) {
+      const reasons = reasonMap.get(slug)
+      if (reasons && reasons.size > 0) blacklistReasons[slug] = [...reasons]
+    }
+  }
+
   return {
     mode: freeMode ? "free" : "cheapest",
     rankings: ordered,
     survivors,
     blacklist,
+    ...(blacklistReasons ? { blacklistReasons } : {}),
     profile,
     computedAt: now,
   }

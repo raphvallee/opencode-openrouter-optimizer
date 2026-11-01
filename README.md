@@ -179,6 +179,7 @@ registers nothing, so no toasts are raised while the server routing keeps runnin
 | `statsCacheMinutes` | `10` | Stats snapshot cache; concurrent refreshes share one snapshot |
 | `dbPath` | global OpenCode data dir | sqlite file override (tests) |
 | `debug` | `false` | Verbose logging |
+| `debugBlacklistReasons` | `false` | With `debug`, also log why every blacklisted provider was blocked |
 
 Every option with its default value, ready to copy into `opencode.jsonc` and tweak
 granularly (you normally never need to set any of these):
@@ -209,7 +210,8 @@ granularly (you normally never need to set any of these):
         "statsCommand": "opencode",
         "statsDays": 30,
         "statsCacheMinutes": 10,
-        "debug": false
+        "debug": false,
+        "debugBlacklistReasons": false
       }
     }
   ]
