@@ -29,6 +29,13 @@ describe("effectiveRates", () => {
     expect(rates.writeRate).toBe(0)
   })
 
+  test("unparseable cache-read prices fall back to the input rate", () => {
+    for (const input_cache_read of ["", "N/A", "free", -1]) {
+      const rates = effectiveRates({ prompt: pricing.prompt, completion: pricing.completion, input_cache_read })
+      expect(rates.readRate).toBeCloseTo(rates.inputRate)
+    }
+  })
+
   test("malformed discount is ignored", () => {
     const rates = effectiveRates({ ...pricing, discount: 2 })
     expect(rates.discount).toBe(0)
@@ -72,6 +79,21 @@ describe("perRequestCost", () => {
     expect(rates.inputRate).toBeCloseTo(0.0000002)
     expect(perRequest).toBeCloseTo(500 * 0.0000002 + 500 * 0.0000004 + 100 * 0.0000005)
   })
+
+  test("unparseable cache-read prices bill cached input at the input rate", () => {
+    const profile = { avgInput: 1000, avgOutput: 0, cacheHitRate: 1, numRequests: 1 }
+    for (const input_cache_read of ["", "N/A", "free", -1]) {
+      const { perRequest } = requestCost({ prompt: "0.000001", completion: "0.000002", input_cache_read }, profile)
+      expect(perRequest).toBeCloseTo(1000 * 0.000001)
+    }
+  })
+
+  test("requestCost refuses unknown cache-write pricing instead of silently billing $0", () => {
+    const profile = { avgInput: 1000, avgOutput: 0, cacheHitRate: 0, numRequests: 1 }
+    expect(() =>
+      requestCost({ prompt: "0.000001", completion: "0.000002", input_cache_write: "N/A" }, profile),
+    ).toThrow()
+  })
 })
 
 describe("hasKnownPricing", () => {
@@ -82,6 +104,15 @@ describe("hasKnownPricing", () => {
     expect(hasKnownPricing({ prompt: "N/A", completion: "0.0000005" })).toBe(false)
     expect(hasKnownPricing({ prompt: -1, completion: "0.0000005" })).toBe(false)
     expect(hasKnownPricing({ completion: "0.0000005" } as never)).toBe(false)
+  })
+
+  test("cache-write prices must be absent or parseable; cache-read prices may be unknown", () => {
+    expect(hasKnownPricing({ prompt: "0.0000002", completion: "0.0000005", input_cache_write: "0" })).toBe(true)
+    expect(hasKnownPricing({ prompt: "0.0000002", completion: "0.0000005", input_cache_write: "N/A" })).toBe(false)
+    expect(hasKnownPricing({ prompt: "0.0000002", completion: "0.0000005", input_cache_write: "" })).toBe(false)
+    expect(hasKnownPricing({ prompt: "0.0000002", completion: "0.0000005", input_cache_write: -1 })).toBe(false)
+    expect(hasKnownPricing({ prompt: "0.0000002", completion: "0.0000005", input_cache_read: "N/A" })).toBe(true)
+    expect(hasKnownPricing({ prompt: "0.0000002", completion: "0.0000005", input_cache_read: "" })).toBe(true)
   })
 })
 
@@ -98,5 +129,16 @@ describe("isFreePricing", () => {
     expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: "0.0000001" })).toBe(false)
     expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: "0" })).toBe(true)
     expect(isFreePricing({ prompt: "0", completion: "0", input_cache_read: "0.0000001" })).toBe(false)
+  })
+
+  test("an unparseable cache-read price falls back to the input price", () => {
+    expect(isFreePricing({ prompt: "0", completion: "0", input_cache_read: "N/A" })).toBe(true)
+    expect(isFreePricing({ prompt: "0.0000002", completion: "0", input_cache_read: "N/A" })).toBe(false)
+  })
+
+  test("an unparseable cache-write price is unknown pricing, never free", () => {
+    expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: "N/A" })).toBe(false)
+    expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: "" })).toBe(false)
+    expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: -1 })).toBe(false)
   })
 })

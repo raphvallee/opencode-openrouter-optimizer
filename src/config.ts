@@ -35,6 +35,11 @@ export interface OptimizerOptions {
    * (topN does not cap them) and blacklist the paid providers.
    */
   preferFreeProviders: boolean
+  /**
+   * Disable the TUI part of the plugin (the `./tui` export): no routing-failure
+   * toasts are raised. The server routing part is unaffected.
+   */
+  noTUI: boolean
   /** Extra provider slugs that are always blacklisted (e.g. "chutes"). */
   extraIgnore: string[]
   /** Env var name for the OpenRouter management key (Activity API). */
@@ -70,6 +75,7 @@ export const DEFAULT_OPTIONS: OptimizerOptions = {
   fallbackAvgOutput: 800,
   fallbackCacheHitRate: 0.2,
   preferFreeProviders: true,
+  noTUI: false,
   extraIgnore: [],
   managementKeyEnv: "OPENROUTER_MANAGEMENT_KEY",
   statsCommand: "opencode",
@@ -80,54 +86,188 @@ export const DEFAULT_OPTIONS: OptimizerOptions = {
   debug: false,
 }
 
-function num(input: unknown, fallback: number): number {
-  if (typeof input === "string") {
-    // "" and "  " coerce to 0 via Number(), which would silently disable filters
-    // like minContextLength; a blank string is "unset", not zero.
-    const trimmed = input.trim()
-    if (trimmed.length === 0) return fallback
-    const parsed = Number(trimmed)
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+const OPTION_KEYS: ReadonlyArray<keyof OptimizerOptions> = [
+  "ttlHours",
+  "topN",
+  "minContextLength",
+  "minMaxCompletionTokens",
+  "minUptimePercent",
+  "requireToolSupport",
+  "maxToolCallErrorRate",
+  "injectSort",
+  "rankingWaitMs",
+  "fallbackAvgInput",
+  "fallbackAvgOutput",
+  "fallbackCacheHitRate",
+  "preferFreeProviders",
+  "noTUI",
+  "extraIgnore",
+  "managementKeyEnv",
+  "statsCommand",
+  "statsDays",
+  "statsCacheMinutes",
+  "statsRun",
+  "dbPath",
+  "debug",
+]
+
+const VALID_KEYS = new Set<string>(OPTION_KEYS)
+
+function describe(value: unknown): string {
+  if (value === null) return "null"
+  if (value === undefined) return "undefined"
+  if (typeof value === "string") return JSON.stringify(value)
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value)
+  if (Array.isArray(value)) return `an array (length ${value.length})`
+  if (typeof value === "object") return "an object"
+  return typeof value
+}
+
+function invalid(key: string, message: string): never {
+  throw new Error(
+    `Invalid plugin configuration: option "${key}" ${message}. ` +
+      `Fix it in your plugin options (for example opencode.json).`,
+  )
+}
+
+interface NumberRule {
+  min?: number
+  max?: number
+  integer?: boolean
+}
+
+function numberOption(
+  raw: Record<string, unknown>,
+  key: keyof OptimizerOptions,
+  fallback: number,
+  rule: NumberRule = {},
+): number {
+  const value = raw[key]
+  if (value === undefined) return fallback
+  let parsed: number
+  if (typeof value === "number") {
+    parsed = value
+  } else if (typeof value === "string" && value.trim().length > 0) {
+    parsed = Number(value.trim())
+  } else {
+    return invalid(key, `must be a finite number, got ${describe(value)}`)
   }
-  return typeof input === "number" && Number.isFinite(input) && input >= 0 ? input : fallback
+  if (!Number.isFinite(parsed)) return invalid(key, `must be a finite number, got ${describe(value)}`)
+  if (rule.min !== undefined && parsed < rule.min) {
+    return invalid(key, `must be >= ${rule.min}, got ${parsed}`)
+  }
+  if (rule.max !== undefined && parsed > rule.max) {
+    return invalid(key, `must be <= ${rule.max}, got ${parsed}`)
+  }
+  if (rule.integer && !Number.isInteger(parsed)) {
+    return invalid(key, `must be an integer, got ${parsed}`)
+  }
+  return parsed
 }
 
-function bool(input: unknown, fallback: boolean): boolean {
-  if (typeof input === "boolean") return input
-  if (input === "true") return true
-  if (input === "false") return false
-  return fallback
+function booleanOption(raw: Record<string, unknown>, key: keyof OptimizerOptions, fallback: boolean): boolean {
+  const value = raw[key]
+  if (value === undefined) return fallback
+  if (typeof value === "boolean") return value
+  if (value === "true") return true
+  if (value === "false") return false
+  return invalid(key, `must be a boolean (true or false), got ${describe(value)}`)
 }
 
-function stringList(input: unknown): string[] {
-  if (!Array.isArray(input)) return []
-  return input.filter((value): value is string => typeof value === "string" && value.length > 0)
+function stringOption(raw: Record<string, unknown>, key: keyof OptimizerOptions, fallback: string): string {
+  const value = raw[key]
+  if (value === undefined) return fallback
+  if (typeof value !== "string") return invalid(key, `must be a string, got ${describe(value)}`)
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return invalid(key, "must be a non-empty string")
+  return trimmed
+}
+
+function optionalStringOption(raw: Record<string, unknown>, key: keyof OptimizerOptions): string | undefined {
+  const value = raw[key]
+  if (value === undefined) return undefined
+  if (typeof value !== "string") return invalid(key, `must be a string when set, got ${describe(value)}`)
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return invalid(key, "must be a non-empty string when set")
+  return trimmed
+}
+
+function optionalFunctionOption(
+  raw: Record<string, unknown>,
+  key: keyof OptimizerOptions,
+): ((args: string[]) => Promise<string>) | undefined {
+  const value = raw[key]
+  if (value === undefined) return undefined
+  if (typeof value !== "function") return invalid(key, `must be a function when set, got ${describe(value)}`)
+  return value as (args: string[]) => Promise<string>
+}
+
+function listOption(raw: Record<string, unknown>, key: keyof OptimizerOptions): string[] {
+  const value = raw[key]
+  if (value === undefined) return []
+  if (!Array.isArray(value)) return invalid(key, `must be an array of non-empty strings, got ${describe(value)}`)
+  return value.map((entry, index) => {
+    if (typeof entry !== "string" || entry.trim().length === 0) {
+      return invalid(`${key}[${index}]`, `must be a non-empty string, got ${describe(entry)}`)
+    }
+    return entry.trim()
+  })
+}
+
+function validateUnknownKeys(raw: Record<string, unknown>): void {
+  const unknown = Object.keys(raw).filter((key) => !VALID_KEYS.has(key))
+  if (unknown.length === 0) return
+  const details = unknown.map((key) => {
+    const suggestion = OPTION_KEYS.find((valid) => valid.toLowerCase() === key.toLowerCase())
+    return suggestion ? `"${key}" (did you mean "${suggestion}"?)` : `"${key}"`
+  })
+  throw new Error(
+    `Invalid plugin configuration: unknown option(s) ${details.join(", ")}. ` +
+      `Valid options: ${OPTION_KEYS.join(", ")}. Fix it in your plugin options (for example opencode.json).`,
+  )
 }
 
 export function resolveOptions(input?: unknown): OptimizerOptions {
-  const raw = (input ?? {}) as Record<string, unknown>
+  if (input === undefined) input = {}
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error(
+      `Invalid plugin configuration: plugin options must be an object, got ${describe(input)}. ` +
+        `Fix it in your plugin options (for example opencode.json).`,
+    )
+  }
+  const raw = input as Record<string, unknown>
+  validateUnknownKeys(raw)
   return {
-    ttlHours: num(raw.ttlHours, DEFAULT_OPTIONS.ttlHours),
-    topN: Math.max(1, num(raw.topN, DEFAULT_OPTIONS.topN)),
-    minContextLength: num(raw.minContextLength, DEFAULT_OPTIONS.minContextLength),
-    minMaxCompletionTokens: num(raw.minMaxCompletionTokens, DEFAULT_OPTIONS.minMaxCompletionTokens),
-    minUptimePercent: num(raw.minUptimePercent, DEFAULT_OPTIONS.minUptimePercent),
-    requireToolSupport: bool(raw.requireToolSupport, DEFAULT_OPTIONS.requireToolSupport),
-    maxToolCallErrorRate: Math.min(100, num(raw.maxToolCallErrorRate, DEFAULT_OPTIONS.maxToolCallErrorRate)),
-    injectSort: bool(raw.injectSort, DEFAULT_OPTIONS.injectSort),
-    rankingWaitMs: num(raw.rankingWaitMs, DEFAULT_OPTIONS.rankingWaitMs),
-    fallbackAvgInput: num(raw.fallbackAvgInput, DEFAULT_OPTIONS.fallbackAvgInput),
-    fallbackAvgOutput: num(raw.fallbackAvgOutput, DEFAULT_OPTIONS.fallbackAvgOutput),
-    fallbackCacheHitRate: Math.min(1, num(raw.fallbackCacheHitRate, DEFAULT_OPTIONS.fallbackCacheHitRate)),
-    preferFreeProviders: bool(raw.preferFreeProviders, DEFAULT_OPTIONS.preferFreeProviders),
-    extraIgnore: stringList(raw.extraIgnore),
-    managementKeyEnv: typeof raw.managementKeyEnv === "string" ? raw.managementKeyEnv : DEFAULT_OPTIONS.managementKeyEnv,
-    statsCommand:
-      typeof raw.statsCommand === "string" && raw.statsCommand.trim().length > 0 ? raw.statsCommand.trim() : DEFAULT_OPTIONS.statsCommand,
-    statsDays: Math.max(1, num(raw.statsDays, DEFAULT_OPTIONS.statsDays)),
-    statsCacheMinutes: num(raw.statsCacheMinutes, DEFAULT_OPTIONS.statsCacheMinutes),
-    statsRun: typeof raw.statsRun === "function" ? (raw.statsRun as (args: string[]) => Promise<string>) : DEFAULT_OPTIONS.statsRun,
-    dbPath: typeof raw.dbPath === "string" && raw.dbPath.length > 0 ? raw.dbPath : DEFAULT_OPTIONS.dbPath,
-    debug: bool(raw.debug, DEFAULT_OPTIONS.debug),
+    ttlHours: numberOption(raw, "ttlHours", DEFAULT_OPTIONS.ttlHours, { min: 0 }),
+    topN: numberOption(raw, "topN", DEFAULT_OPTIONS.topN, { min: 1, integer: true }),
+    minContextLength: numberOption(raw, "minContextLength", DEFAULT_OPTIONS.minContextLength, { min: 0, integer: true }),
+    minMaxCompletionTokens: numberOption(raw, "minMaxCompletionTokens", DEFAULT_OPTIONS.minMaxCompletionTokens, {
+      min: 0,
+      integer: true,
+    }),
+    minUptimePercent: numberOption(raw, "minUptimePercent", DEFAULT_OPTIONS.minUptimePercent, { min: 0, max: 100 }),
+    requireToolSupport: booleanOption(raw, "requireToolSupport", DEFAULT_OPTIONS.requireToolSupport),
+    maxToolCallErrorRate: numberOption(raw, "maxToolCallErrorRate", DEFAULT_OPTIONS.maxToolCallErrorRate, {
+      min: 0,
+      max: 100,
+    }),
+    injectSort: booleanOption(raw, "injectSort", DEFAULT_OPTIONS.injectSort),
+    rankingWaitMs: numberOption(raw, "rankingWaitMs", DEFAULT_OPTIONS.rankingWaitMs, { min: 0, integer: true }),
+    fallbackAvgInput: numberOption(raw, "fallbackAvgInput", DEFAULT_OPTIONS.fallbackAvgInput, { min: 0 }),
+    fallbackAvgOutput: numberOption(raw, "fallbackAvgOutput", DEFAULT_OPTIONS.fallbackAvgOutput, { min: 0 }),
+    fallbackCacheHitRate: numberOption(raw, "fallbackCacheHitRate", DEFAULT_OPTIONS.fallbackCacheHitRate, {
+      min: 0,
+      max: 1,
+    }),
+    preferFreeProviders: booleanOption(raw, "preferFreeProviders", DEFAULT_OPTIONS.preferFreeProviders),
+    noTUI: booleanOption(raw, "noTUI", DEFAULT_OPTIONS.noTUI),
+    extraIgnore: listOption(raw, "extraIgnore"),
+    managementKeyEnv: stringOption(raw, "managementKeyEnv", DEFAULT_OPTIONS.managementKeyEnv),
+    statsCommand: stringOption(raw, "statsCommand", DEFAULT_OPTIONS.statsCommand),
+    statsDays: numberOption(raw, "statsDays", DEFAULT_OPTIONS.statsDays, { min: 1, integer: true }),
+    statsCacheMinutes: numberOption(raw, "statsCacheMinutes", DEFAULT_OPTIONS.statsCacheMinutes, { min: 0 }),
+    statsRun: optionalFunctionOption(raw, "statsRun"),
+    dbPath: optionalStringOption(raw, "dbPath"),
+    debug: booleanOption(raw, "debug", DEFAULT_OPTIONS.debug),
   }
 }

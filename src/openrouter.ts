@@ -145,15 +145,43 @@ export async function fetchOpenRouterProfile(
   return sumActivity(rows, target)
 }
 
+function activityNumber(
+  row: ActivityRow,
+  field: "requests" | "prompt_tokens" | "completion_tokens" | "cached_tokens",
+  rowIndex: number,
+  required: boolean,
+): number {
+  const value = row[field]
+  if (value === undefined || value === null) {
+    if (required) {
+      throw new Error(`activity row ${rowIndex} is missing ${field}`)
+    }
+    return 0
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(
+      `activity row ${rowIndex} has invalid ${field}: expected a finite non-negative number, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
+}
+
 export function sumActivity(rows: ActivityRow[], slugMatch: string): ActivityResult {
   const target = slugMatch.toLowerCase()
   const result: ActivityResult = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0 }
-  for (const row of rows) {
-    if (baseModelSlug(row.model ?? "").toLowerCase() !== target) continue
-    result.requests += row.requests ?? 0
-    result.promptTokens += row.prompt_tokens ?? 0
-    result.completionTokens += row.completion_tokens ?? 0
-    result.cachedTokens += row.cached_tokens ?? 0
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index]
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error(`activity row ${index} is not an object`)
+    }
+    if (typeof row.model !== "string") {
+      throw new Error(`activity row ${index} has invalid model: expected a string, got ${JSON.stringify(row.model)}`)
+    }
+    if (baseModelSlug(row.model).toLowerCase() !== target) continue
+    result.requests += activityNumber(row, "requests", index, true)
+    result.promptTokens += activityNumber(row, "prompt_tokens", index, true)
+    result.completionTokens += activityNumber(row, "completion_tokens", index, true)
+    result.cachedTokens += activityNumber(row, "cached_tokens", index, false)
   }
   return result
 }
@@ -200,11 +228,14 @@ interface ToolCallErrorRow {
   volume?: Record<string, number>
 }
 
-function unwrapData(payload: unknown): unknown[] {
+function unwrapData(payload: unknown, status: number, context: string): unknown[] {
   const data = (payload as { data?: unknown } | null)?.data
   if (Array.isArray(data)) return data
   if (Array.isArray(payload)) return payload as unknown[]
-  return []
+  // Returning [] here would silently turn envelope drift into "no data" and the
+  // filter would disappear without a trace. Mirror the activity client: throw so
+  // the caller warns with the route and status.
+  throw new OpenRouterError(`unexpected ${context} payload`, status)
 }
 
 /**
@@ -246,18 +277,34 @@ export async function fetchToolCallErrorRate(
   }
 
   const idToSlug = new Map<string, string>()
-  for (const entry of unwrapData(await perfResponse.json()) as FrontendEndpoint[]) {
+  for (const entry of unwrapData(await perfResponse.json(), perfResponse.status, `endpoint stats for ${permaslug}`) as FrontendEndpoint[]) {
     if (!entry || typeof entry.id !== "string") continue
     const mapped = providerSlug({ tag: entry.tag ?? "", provider_name: entry.provider_name ?? entry.provider_slug ?? "" } as OpenRouterEndpoint)
     if (mapped) idToSlug.set(entry.id, mapped)
   }
 
+  const rows = unwrapData(
+    await rateResponse.json(),
+    rateResponse.status,
+    `tool call error rate for ${permaslug}`,
+  ) as ToolCallErrorRow[]
   const sums = new Map<string, { weighted: number; volume: number }>()
-  for (const row of unwrapData(await rateResponse.json()) as ToolCallErrorRow[]) {
-    for (const [id, rate] of Object.entries(row?.y ?? {})) {
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new OpenRouterError(`tool call error rate payload for ${permaslug} contains a non-object row`, rateResponse.status)
+    }
+    const ratesByEndpoint = row.y
+    const volumes = row.volume
+    if (ratesByEndpoint !== undefined && (typeof ratesByEndpoint !== "object" || ratesByEndpoint === null || Array.isArray(ratesByEndpoint))) {
+      throw new OpenRouterError(`tool call error rate payload for ${permaslug} has an invalid y map`, rateResponse.status)
+    }
+    if (volumes !== undefined && (typeof volumes !== "object" || volumes === null || Array.isArray(volumes))) {
+      throw new OpenRouterError(`tool call error rate payload for ${permaslug} has an invalid volume map`, rateResponse.status)
+    }
+    for (const [id, rate] of Object.entries(ratesByEndpoint ?? {})) {
       const target = idToSlug.get(id)
       if (!target) continue
-      const volume = row?.volume?.[id]
+      const volume = volumes?.[id]
       // Volume is the daily request count behind the rate; without it the rate
       // cannot be weighted, so a lone unweighted sample must not decide the filter.
       if (typeof rate !== "number" || !Number.isFinite(rate) || typeof volume !== "number" || volume <= 0) continue
@@ -271,6 +318,11 @@ export async function fetchToolCallErrorRate(
   const rates = new Map<string, number>()
   for (const [target, acc] of sums) {
     if (acc.volume > 0) rates.set(target, acc.weighted / acc.volume)
+  }
+  if (rows.length > 0 && rates.size === 0) {
+    // Rows arrived but none could be weighted: id mapping, rate, or volume drift.
+    // Treat it as envelope damage instead of returning "no providers filtered".
+    throw new OpenRouterError(`tool call error rate payload for ${permaslug} had rows but no usable rates`, rateResponse.status)
   }
   return rates
 }

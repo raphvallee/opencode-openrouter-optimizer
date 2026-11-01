@@ -54,6 +54,21 @@ describe("filterEndpoint", () => {
     expect(filterEndpoint(endpoint({ pricing: { prompt: "0.0000001", completion: "" } }), DEFAULT_OPTIONS)).toBe("pricing")
   })
 
+  test("drops an unparseable cache-write price but accepts an unknown cache-read price", () => {
+    expect(
+      filterEndpoint(
+        endpoint({ pricing: { prompt: "0.0000001", completion: "0.0000005", input_cache_write: "N/A" } }),
+        DEFAULT_OPTIONS,
+      ),
+    ).toBe("pricing")
+    expect(
+      filterEndpoint(
+        endpoint({ pricing: { prompt: "0.0000001", completion: "0.0000005", input_cache_read: "N/A" } }),
+        DEFAULT_OPTIONS,
+      ),
+    ).toBeUndefined()
+  })
+
   test("accepts a healthy endpoint", () => {
     expect(filterEndpoint(endpoint(), DEFAULT_OPTIONS)).toBeUndefined()
   })
@@ -141,6 +156,30 @@ describe("rankProviders", () => {
     expect(onlyJunk.survivors).toEqual([])
     expect(onlyJunk.blacklist).toEqual([])
   })
+
+  test("an unparseable cache-write price is blacklisted like other unknown pricing", () => {
+    const junkWrite = endpoint({
+      provider_name: "junkwrite",
+      tag: "junkwrite/fp8",
+      pricing: { prompt: "0.0000001", completion: "0.0000002", input_cache_write: "N/A" },
+    })
+    const ranking = rankProviders([junkWrite, ...endpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.survivors).not.toContain("junkwrite")
+    expect(ranking.blacklist).toContain("junkwrite")
+  })
+
+  test("an unparseable cache-read price is not blacklisted and bills cached input at the input rate", () => {
+    const readUnknown = endpoint({
+      provider_name: "readunknown",
+      tag: "readunknown/fp8",
+      pricing: { prompt: "0.0000001", completion: "0.0000001", input_cache_read: "N/A" },
+    })
+    const ranking = rankProviders([readUnknown], profile, DEFAULT_OPTIONS)
+    expect(ranking.survivors).toEqual(["readunknown"])
+    expect(ranking.blacklist).toEqual([])
+    // h = 0.5: no cache discount, so cached and uncached input both bill at 1e-7.
+    expect(ranking.rankings[0].perRequest).toBeCloseTo(10_000 * 0.0000001 + 1_000 * 0.0000001)
+  })
 })
 
 describe("composeRouting", () => {
@@ -226,6 +265,29 @@ describe("free-priority mode", () => {
     expect(ranking.mode).toBe("cheapest")
     expect(ranking.survivors).toEqual(["alpha", "beta", "gamma"])
     expect(ranking.blacklist).toEqual(["free1"])
+  })
+
+  test("an unparseable cache-write price cannot enter free mode", () => {
+    const junkFree = endpoint({
+      provider_name: "junkfree",
+      tag: "junkfree/fp8",
+      pricing: { prompt: "0", completion: "0", input_cache_write: "N/A" },
+    })
+    const ranking = rankProviders([junkFree, ...paidEndpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("cheapest")
+    expect(ranking.survivors).toEqual(["alpha", "beta", "gamma"])
+    expect(ranking.blacklist).toContain("junkfree")
+  })
+
+  test("an unknown cache-read price does not stop a zero-priced provider from being free", () => {
+    const freeReadUnknown = endpoint({
+      provider_name: "freeread",
+      tag: "freeread/fp8",
+      pricing: { prompt: "0", completion: "0", input_cache_read: "N/A" },
+    })
+    const ranking = rankProviders([freeReadUnknown, ...paidEndpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("free")
+    expect(ranking.survivors).toContain("freeread")
   })
 
   test("preferFreeProviders=false restores the plain cost ranking", () => {

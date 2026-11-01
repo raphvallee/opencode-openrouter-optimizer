@@ -225,6 +225,14 @@ async function defaultRun(args: string[]): Promise<string> {
   }
 }
 
+function validProfileNumber(value: unknown, label: string): number {
+  if (value === undefined || value === null) return 0
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${label}: expected a finite non-negative number, got ${JSON.stringify(value)}`)
+  }
+  return value
+}
+
 export function mergeProfile(
   local: LocalProfile | undefined,
   openrouter: { requests: number; promptTokens: number; completionTokens: number; cachedTokens: number } | undefined,
@@ -232,8 +240,8 @@ export function mergeProfile(
   /** Optional debug sink; the plugin passes its debug-gated logger. */
   log?: (message: string, data: Record<string, number>) => void,
 ): RequestProfile {
-  const localRequests = local?.requests ?? 0
-  const remoteRequests = openrouter?.requests ?? 0
+  const localRequests = validProfileNumber(local?.requests, "local requests")
+  const remoteRequests = validProfileNumber(openrouter?.requests, "remote requests")
   const requests = localRequests + remoteRequests
 
   if (requests === 0) {
@@ -245,12 +253,12 @@ export function mergeProfile(
     }
   }
 
-  const localInput = local?.totalInput ?? 0
-  const localCached = local?.cachedInput ?? 0
-  const localOutput = local?.totalOutput ?? 0
-  const remoteInput = openrouter?.promptTokens ?? 0
-  const remoteCached = openrouter?.cachedTokens ?? 0
-  const remoteOutput = openrouter?.completionTokens ?? 0
+  const localInput = validProfileNumber(local?.totalInput, "local totalInput")
+  const localCached = validProfileNumber(local?.cachedInput, "local cachedInput")
+  const localOutput = validProfileNumber(local?.totalOutput, "local totalOutput")
+  const remoteInput = validProfileNumber(openrouter?.promptTokens, "remote promptTokens")
+  const remoteCached = validProfileNumber(openrouter?.cachedTokens, "remote cachedTokens")
+  const remoteOutput = validProfileNumber(openrouter?.completionTokens, "remote completionTokens")
 
   const totalInput = localInput + remoteInput
   const totalOutput = localOutput + remoteOutput

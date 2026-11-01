@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { baseModelSlug, fetchModelEndpoints, fetchOpenRouterProfile, OpenRouterError } from "../src/openrouter"
+import { baseModelSlug, fetchModelEndpoints, fetchOpenRouterProfile, fetchToolCallErrorRate, OpenRouterError } from "../src/openrouter"
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
@@ -123,5 +123,74 @@ describe("fetchOpenRouterProfile", () => {
       fetchImpl: async () => jsonResponse({ data: [] }),
     })
     expect(activity).toEqual({ requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0 })
+  })
+
+  test("throws when an activity row field is a string instead of a number", async () => {
+    const failure = fetchOpenRouterProfile("vendor/model", "key", {
+      fetchImpl: async () =>
+        jsonResponse([
+          { date: "2026-01-01", model: "vendor/model", requests: "2", prompt_tokens: 100, completion_tokens: 10 },
+        ]),
+    })
+    await expect(failure).rejects.toThrow(/activity row 0 has invalid requests/)
+  })
+
+  test("throws when an activity row field is negative", async () => {
+    const failure = fetchOpenRouterProfile("vendor/model", "key", {
+      fetchImpl: async () =>
+        jsonResponse([
+          { date: "2026-01-01", model: "vendor/model", requests: 2, prompt_tokens: -1, completion_tokens: 10 },
+        ]),
+    })
+    await expect(failure).rejects.toThrow(/activity row 0 has invalid prompt_tokens/)
+  })
+})
+
+describe("fetchToolCallErrorRate", () => {
+  function statsResponse(url: string, perf: unknown, rate: unknown): Response {
+    return jsonResponse(String(url).includes("tool-call-error-rate") ? rate : perf)
+  }
+
+  test("returns volume-weighted rates per provider", async () => {
+    const rates = await fetchToolCallErrorRate("vendor/model", {
+      fetchImpl: async (url) =>
+        statsResponse(
+          String(url),
+          {
+            data: [
+              { id: "e1", tag: "alpha/fp8", provider_name: "Alpha" },
+              { id: "e2", tag: "alpha/fp8", provider_name: "Alpha" },
+            ],
+          },
+          { data: [{ y: { e1: 2, e2: 4 }, volume: { e1: 100, e2: 300 } }] },
+        ),
+    })
+    expect(rates.get("alpha")).toBeCloseTo(3.5)
+  })
+
+  test("throws on an unrecognized stats envelope instead of returning an empty map", async () => {
+    const failure = fetchToolCallErrorRate("vendor/model", {
+      fetchImpl: async (url) => statsResponse(String(url), { unexpected: true }, { unexpected: true }),
+    })
+    await expect(failure).rejects.toBeInstanceOf(OpenRouterError)
+  })
+
+  test("throws when rows arrive but none can be weighted", async () => {
+    const failure = fetchToolCallErrorRate("vendor/model", {
+      fetchImpl: async (url) =>
+        statsResponse(
+          String(url),
+          { data: [{ id: "e1", tag: "alpha/fp8" }] },
+          { data: [{ y: { unknown: 2 }, volume: { unknown: 100 } }] },
+        ),
+    })
+    await expect(failure).rejects.toThrow(/had rows but no usable rates/)
+  })
+
+  test("an empty stats envelope returns an empty rate map", async () => {
+    const rates = await fetchToolCallErrorRate("vendor/model", {
+      fetchImpl: async (url) => statsResponse(String(url), { data: [] }, { data: [] }),
+    })
+    expect(rates.size).toBe(0)
   })
 })

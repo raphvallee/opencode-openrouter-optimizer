@@ -522,14 +522,22 @@ describe("hot path", () => {
     }
   }, 10_000)
 
-  test("a non-JSON body passes through untouched", async () => {
+  test("a non-JSON body passes through untouched and warns once", async () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY
     const savedFetch = globalThis.fetch
     const realFetch = withStatsFallback(savedFetch.bind(globalThis))
+    let endpointCalls = 0
+    const warnings: string[] = []
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    })
     globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
-      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      if (url === ENDPOINTS_URL) {
+        endpointCalls++
+        return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      }
       return realFetch(input as never, init)
     }) as typeof fetch
 
@@ -551,8 +559,17 @@ describe("hot path", () => {
         await handler(evt)
         // Untouched: the original body goes out byte-for-byte.
         expect(await (evt as { request: Request }).request.text()).toBe("not json at all")
+        // The refresh starts before parsing, so a non-JSON body still builds a ranking.
+        for (let i = 0; i < 40 && endpointCalls === 0; i++) await sleep(25)
+        expect(endpointCalls).toBeGreaterThan(0)
+        // The skip is loud, not debug-only.
+        expect(warnings.some((line) => line.includes("request body is not JSON"))).toBe(true)
       } finally {
-        await cleanup?.()
+        try {
+          await cleanup?.()
+        } finally {
+          spy.mockRestore()
+        }
       }
     } finally {
       globalThis.fetch = savedFetch
@@ -566,6 +583,10 @@ describe("hot path", () => {
     delete process.env.OPENROUTER_MANAGEMENT_KEY
     const savedFetch = globalThis.fetch
     const urls: string[] = []
+    const warnings: string[] = []
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    })
     // Endpoint names without the "Provider | permaslug" tail: no permaslug can
     // be recovered, so the frontend stats probe must never be attempted.
     const noPermaslugPayload = {
@@ -597,14 +618,63 @@ describe("hot path", () => {
         const handler = hooks.get("http.request")!.handler
         const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
         await handler(evt)
-        // The filter is silently off, but routing still works.
+        // The filter cannot run without a permaslug; that skip is warned, not silent.
         expect(urls.some((u) => u.includes("/api/frontend/"))).toBe(false)
+        expect(warnings.some((line) => line.includes("tool call error rate skipped"))).toBe(true)
         const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
           provider?: { ignore?: string[]; sort?: string }
         }
         expect(parsed.provider?.sort).toBe("price")
       } finally {
-        await cleanup?.()
+        try {
+          await cleanup?.()
+        } finally {
+          spy.mockRestore()
+        }
+      }
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
+  test("a failed tool call error rate probe warns once and still routes", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const warnings: string[] = []
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    })
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      if (url.includes("/api/frontend/v1/stats/")) {
+        return Promise.resolve(new Response("stats unavailable", { status: 503 }))
+      }
+      return savedFetch.bind(globalThis)(input as never, init)
+    }) as typeof fetch
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({ dbPath: ":memory:", statsRun: async () => JSON.stringify({ models: [] }) } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      try {
+        const handler = hooks.get("http.request")!.handler
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+        expect(warnings.some((line) => line.includes("tool call error rate unavailable"))).toBe(true)
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { ignore?: string[]; sort?: string }
+        }
+        expect(parsed.provider?.ignore).toEqual(["epsilon"])
+      } finally {
+        try {
+          await cleanup?.()
+        } finally {
+          spy.mockRestore()
+        }
       }
     } finally {
       globalThis.fetch = savedFetch

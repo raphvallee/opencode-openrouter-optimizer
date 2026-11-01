@@ -109,6 +109,30 @@ describe("OptimizerDb", () => {
     }
   })
 
+  test("a corrupt blacklist_json reads as never ranked instead of an empty blacklist", () => {
+    const dir = mkdtempSync(join(tmpdir(), "optimizer-db-"))
+    const path = join(dir, "corrupt-blacklist.db")
+    const db = new OptimizerDb(path)
+    try {
+      db.saveRefresh("vendor/model", { survivors: ["a"], blacklist: ["b"], computedAt: 10 }, 20)
+      // Corrupt the blacklist out-of-band, the way disk corruption would.
+      const raw = new Database(path)
+      raw.run("UPDATE fetches SET blacklist_json = '{not json' WHERE model = 'vendor/model'")
+      raw.close()
+
+      const states = db.loadRoutingStates(false)
+      const corrupt = states.find((state) => state.model === "vendor/model")!
+      // The row still claims to be fresh, but routing is gone: the plugin then
+      // forces a re-rank instead of silently treating the blacklist as empty
+      // and re-allowing the providers it was meant to block.
+      expect(corrupt.lastFetched).toBe(20)
+      expect(corrupt.routing).toBeUndefined()
+    } finally {
+      db.close()
+      removeDir(dir)
+    }
+  })
+
   test("recordFailure increments attempts and stores the backoff deadline", () => {
     const db = new OptimizerDb(":memory:")
     try {

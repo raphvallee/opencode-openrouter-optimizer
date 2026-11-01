@@ -95,13 +95,18 @@ function openPath(explicit?: string): string {
   return join(base, "openrouter-optimizer.db")
 }
 
-function parseArray(json: string | null): string[] {
-  if (!json) return []
+function parseBlacklist(json: string | null): string[] | null {
+  if (json === null) return []
   try {
     const parsed = JSON.parse(json)
-    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : []
+    if (!Array.isArray(parsed)) return null
+    // A blacklist entry that is not a string means the row is damaged. Treat the
+    // whole snapshot as unreadable so the next request re-ranks instead of silently
+    // dropping a provider from the blacklist and re-allowing its traffic.
+    if (parsed.some((value) => typeof value !== "string")) return null
+    return parsed as string[]
   } catch {
-    return []
+    return null
   }
 }
 
@@ -140,11 +145,12 @@ function modeOf(value: string | null): "free" | "cheapest" {
 /** Build the in-memory state from a stored row. Parsing stays in one place. */
 export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingState {
   const survivors = parseSurvivors(row.survivors_json)
+  const blacklist = parseBlacklist(row.blacklist_json)
   const routing: RoutingSnapshot | undefined =
-    survivors !== null
+    survivors !== null && blacklist !== null
       ? {
           survivors,
-          blacklist: parseArray(row.blacklist_json),
+          blacklist,
           computedAt: row.computed_at ?? row.updated_at,
           mode: modeOf(row.mode),
         }

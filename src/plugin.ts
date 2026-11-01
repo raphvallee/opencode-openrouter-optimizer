@@ -10,9 +10,18 @@ import { mergeProfile, OpenCodeStats, type LocalProfile } from "./stats"
 interface HttpEventLike {
   request?: Request
   model?: { providerID?: string; modelID?: string }
+  sessionID?: string
 }
 
 const LOG_PREFIX = "[openrouter-optimizer]"
+
+/**
+ * Metadata key the server part stamps on routing-failure synthetic messages so the
+ * TUI part (src/tui.ts) can recognize them without parsing message text. Duplicated
+ * as a literal there on purpose: the TUI part must not import server code, which
+ * would pull bun:sqlite into the TUI process.
+ */
+const ROUTING_FAILURE_METADATA_KEY = "openrouter-optimizer"
 
 /** Failure backoff: 30s doubling to 1h, with 50-100% jitter. */
 const RETRY_BASE_MS = 30_000
@@ -63,11 +72,20 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
   return Plugin.define({
     id: "openrouter-optimizer",
     async setup(ctx) {
-      const options = resolveOptions({
-        ...DEFAULT_OPTIONS,
-        ...overrides,
-        ...((ctx.options ?? {}) as Record<string, unknown>),
-      })
+      let options: OptimizerOptions
+      try {
+        options = resolveOptions({
+          ...DEFAULT_OPTIONS,
+          ...overrides,
+          ...((ctx.options ?? {}) as Record<string, unknown>),
+        })
+      } catch (error) {
+        // Invalid configuration must stop the plugin instead of silently falling back
+        // to defaults: a typo like "topn" or "injectSort: 0" would otherwise change
+        // routing without the user knowing.
+        console.error(LOG_PREFIX, error instanceof Error ? error.message : error)
+        throw error
+      }
       const debug = (...parts: unknown[]) => {
         if (options.debug) console.log(LOG_PREFIX, ...parts)
       }
@@ -103,6 +121,41 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       // through unrouted, which must not be invisible.
       const unroutedWarned = new Set<string>()
 
+      // One-time notices per session/model for requests that could not be routed and
+      // went out unfiltered. Synthetic messages make the failure visible in the TUI.
+      const notifiedFailures = new Set<string>()
+
+      /**
+       * Tell the session that a request could not be routed and was sent unfiltered.
+       * Synthetic messages appear in the TUI, unlike console warnings buried in logs.
+       * Fire-and-forget: a notification must never delay or fail the request.
+       */
+      function notifyRoutingFailure(evt: HttpEventLike, reason: string, error?: unknown): void {
+        const sessionID = evt.sessionID
+        if (!sessionID) return
+        const model = typeof evt.model?.modelID === "string" ? evt.model.modelID : "unknown"
+        const key = `${sessionID}:${model}:${reason}`
+        if (notifiedFailures.has(key)) return
+        notifiedFailures.add(key)
+        const detail = error instanceof Error ? error.message : error ? String(error) : ""
+        const text = `OpenRouter optimizer could not route ${model} (${reason}); the request was sent unfiltered.${detail ? ` ${detail}` : ""}`
+        void ctx.session
+          .synthetic({
+            sessionID,
+            text,
+            description: "Routing failure",
+            // Machine-readable flag so the TUI part can raise a toast without
+            // sniffing message text.
+            metadata: { [ROUTING_FAILURE_METADATA_KEY]: { kind: "routing-failure" } },
+          })
+          .catch((notifyError: unknown) => {
+            warn(
+              "failed to notify session about routing failure:",
+              notifyError instanceof Error ? notifyError.message : notifyError,
+            )
+          })
+      }
+
       // Same notice class: a ranking persisted with no usage data at all prices
       // endpoints with a guessed token profile, which can rank the wrong
       // providers cheapest. One notice per model keeps a fresh install quiet
@@ -112,6 +165,11 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       // Activity data silently disappears when the management key is unset; one
       // notice explains where the ranking's numbers come from instead.
       let activityKeyWarned = false
+
+      // Non-JSON bodies and optional stats probes are skipped by design; each skip must
+      // still surface once instead of disappearing into debug logs.
+      let bodyFormatWarned = false
+      const toolRateWarned = new Set<string>()
 
       // Hot path state: warm the cache once, then every request is a map lookup.
       // The DB stays durable; another process may refresh behind us, which is bounded
@@ -195,10 +253,10 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           }
 
           // Tool Call Error Rate: optional data, fetched only when the filter is on.
-          // Failures are swallowed: ranking proceeds without the filter instead of
-          // blocking every provider on a flaky stats route. The permaslug comes from
-          // the endpoints payload itself (its name tails), so no extra resolution
-          // request is needed.
+          // A failure or an empty result means the filter cannot run. That is allowed,
+          // but it must not be silent: warn once per model instead of ranking as if
+          // every provider were below the cap. The permaslug comes from the endpoints
+          // payload itself (its name tails), so no extra resolution request is needed.
           if (options.maxToolCallErrorRate < 100) {
             const permaslug = permaslugFromEndpoints(endpoints.endpoints)
             if (permaslug) {
@@ -207,15 +265,35 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
                   signal: controller.signal,
                   timeRange: "1w",
                 })
-                for (const endpoint of endpoints.endpoints) {
-                  endpoint.toolCallErrorRate = rates.get(providerSlug(endpoint))
+                if (rates.size === 0) {
+                  if (!toolRateWarned.has(model)) {
+                    toolRateWarned.add(model)
+                    warn(`${model}: tool call error rate data is empty, ranking without the filter`)
+                  }
+                } else {
+                  for (const endpoint of endpoints.endpoints) {
+                    endpoint.toolCallErrorRate = rates.get(providerSlug(endpoint))
+                  }
                 }
               } catch (error) {
                 if (isAbortError(error)) throw error
-                debug("tool call error rate unavailable, ranking without it:", error)
+                if (!toolRateWarned.has(model)) {
+                  toolRateWarned.add(model)
+                  warn(
+                    `tool call error rate unavailable for ${model}, ranking without it:`,
+                    error instanceof Error ? error.message : error,
+                  )
+                } else {
+                  debug("tool call error rate unavailable, ranking without it:", error)
+                }
               }
             } else {
-              debug("tool call error rate skipped: the endpoints payload carries no permaslug")
+              if (!toolRateWarned.has(model)) {
+                toolRateWarned.add(model)
+                warn(`tool call error rate skipped for ${model}: the endpoints payload carries no permaslug`)
+              } else {
+                debug("tool call error rate skipped: the endpoints payload carries no permaslug")
+              }
             }
           }
 
@@ -374,7 +452,12 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         const url = request.url ?? ""
         const providerID = evt.model?.providerID
         if (request.method !== "POST") return
-        if (!/openrouter\.ai/.test(url) && providerID !== "openrouter") return
+        // Only OpenRouter traffic is ours to route. A provider explicitly configured as
+        // something else (ollama, codex subscriptions, ...) is left untouched even if
+        // its URL happens to contain openrouter.ai. When the provider ID is missing,
+        // fall back to the request URL.
+        const isOpenRouter = providerID === "openrouter" || (providerID === undefined && /openrouter\.ai/.test(url))
+        if (!isOpenRouter) return
 
         const now = Date.now()
         const refModel = typeof evt.model?.modelID === "string" ? evt.model.modelID : ""
@@ -386,12 +469,16 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         let state: RoutingState | undefined
         if (refModel) {
           state = stateFor(refModel, now)
-          if (state.routing) {
-            ensureFresh(state, now)
-            if (!hasInjection(state.routing)) {
-              logRouting(refModel, state)
-              return
+          // Start (or join) the refresh before reading the body. If the body turns out
+          // to be non-JSON, routing cannot run for this request, but the ranking for
+          // later requests must still be built instead of being skipped forever.
+          ensureFresh(state, now)
+          if (state.routing && !hasInjection(state.routing)) {
+            logRouting(refModel, state)
+            if (state.routing.survivors.length === 0) {
+              notifyRoutingFailure(evt, "no endpoint passed the filters")
             }
+            return
           }
           // No ranking yet: read the body first. It may name a variant with its own
           // ranking, and it decides which model actually needs to be ranked.
@@ -404,6 +491,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           raw = await request.clone().text()
         } catch (error) {
           warn("request body unreadable:", error instanceof Error ? error.message : error)
+          notifyRoutingFailure(evt, "request body unreadable", error)
           return
         }
 
@@ -413,14 +501,24 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           body = JSON.parse(raw) as { model?: unknown }
           model = typeof (body as { model?: unknown }).model === "string" ? ((body as { model?: string }).model ?? "") : ""
         } catch (error) {
-          // A non-JSON body cannot carry routing. Leave the original request
-          // untouched, but leave a trace: an unnoticed body-format change would
-          // otherwise disable routing with zero signal.
-          debug("request body is not JSON, routing skipped:", error instanceof Error ? error.message : error)
+          // A non-JSON body cannot carry routing. Leave the original request untouched,
+          // but say so once: at default log levels a silent skip looks exactly like a
+          // plugin that is not installed. The refresh already started above.
+          const message = error instanceof Error ? error.message : String(error)
+          if (!bodyFormatWarned) {
+            bodyFormatWarned = true
+            warn("request body is not JSON, routing skipped:", message)
+          } else {
+            debug("request body is not JSON, routing skipped:", message)
+          }
+          notifyRoutingFailure(evt, "request body is not JSON", error)
           return
         }
 
-        if (typeof body !== "object" || body === null || !model.includes("/")) return
+        if (typeof body !== "object" || body === null || !model.includes("/")) {
+          notifyRoutingFailure(evt, "invalid request body")
+          return
+        }
 
         if (model !== refModel) {
           state = stateFor(model, now)
@@ -433,7 +531,17 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           state = await awaitRanking(state, now)
         }
         const routing = state?.routing
-        if (!routing || !hasInjection(routing)) {
+        if (!routing) {
+          logRouting(model, state)
+          notifyRoutingFailure(evt, "no ranking available")
+          return
+        }
+        if (routing.survivors.length === 0) {
+          logRouting(model, state)
+          notifyRoutingFailure(evt, "no endpoint passed the filters")
+          return
+        }
+        if (!hasInjection(routing)) {
           logRouting(model, state)
           return
         }
@@ -473,6 +581,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           await routeRequest(evt)
         } catch (error) {
           warn("routing skipped, request passes through:", error instanceof Error ? error.message : error)
+          notifyRoutingFailure(evt, "routing error", error)
         }
       })
 
