@@ -210,11 +210,30 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
 			// by the same TTL the routing decisions already use.
 			const routes = new Map<string, RoutingState>();
 
-			/** A row that claims a fresh ranking but carries no readable one is damage: say so once. */
+			/**
+			 * A row that claims a fresh ranking but carries no readable one is damage:
+			 * a fetch was recorded without its ranking. Repair it instead of only
+			 * reporting it. Without the repair the notice repeats on every start for
+			 * a model that is never requested again, because the re-rank it promises
+			 * needs a request that never comes.
+			 */
 			function adoptState(state: RoutingState): RoutingState {
 				if (state.lastFetched !== null && !state.routing) {
+					try {
+						db.resetUnreadableRanking(state.model);
+					} catch (error) {
+						warn(
+							`could not reset the unreadable ranking for ${state.model}:`,
+							error instanceof Error ? error.message : error,
+						);
+					}
+					// Mirror the reset in memory: the row no longer looks fresh, so the
+					// next request re-ranks it instead of skipping the refresh.
+					state.lastFetched = null;
+					state.attempts = 0;
+					state.retryAfter = null;
 					warn(
-						`${state.model}: stored ranking is unreadable, the next request will re-rank`,
+						`${state.model}: stored ranking is unreadable, it was discarded; the next request re-ranks`,
 					);
 				}
 				return state;

@@ -292,6 +292,7 @@ export class OptimizerDb {
   private readonly recordFailureStmt: Statement
   private readonly upsertRanking: Statement
   private readonly touchFetch: Statement
+  private readonly resetUnreadableStmt: Statement
   private closed = false
 
   constructor(path?: string) {
@@ -357,6 +358,22 @@ export class OptimizerDb {
         blacklist_reasons_json = excluded.blacklist_reasons_json,
         updated_at = excluded.updated_at
     `)
+    // A row that claims a fresh ranking but carries none must stop claiming it:
+    // "fresh" without a ranking routes nothing while it looks fresh for the
+    // whole TTL. Reset it to "never ranked" so the next request re-ranks it.
+    this.resetUnreadableStmt = this.db.prepare(`
+      UPDATE fetches SET
+        last_fetched = NULL,
+        last_attempt = NULL,
+        attempts = 0,
+        retry_after = NULL,
+        survivors_json = NULL,
+        blacklist_json = NULL,
+        mode = NULL,
+        computed_at = NULL,
+        updated_at = ?
+      WHERE model = ?
+    `)
   }
 
   /** Throwing early beats a confusing "database is closed" sqlite error mid-statement. */
@@ -416,6 +433,17 @@ export class OptimizerDb {
   recordFailure(model: string, now: number, retryAfter: number): void {
     this.assertOpen()
     this.recordFailureStmt.run(model, now, retryAfter, now)
+  }
+
+  /**
+   * Reset a row whose stored ranking is unreadable (corrupt JSON, or a fetch
+   * that was recorded without its ranking). The row keeps its identity, but it
+   * stops claiming to be freshly ranked: a stale "fresh" marker on a row with
+   * no ranking is what makes the plugin warn about it on every start.
+   */
+  resetUnreadableRanking(model: string): void {
+    this.assertOpen()
+    this.resetUnreadableStmt.run(Date.now(), model)
   }
 
   /** Legacy-compatible fetch write: last_fetched only, no endpoint payload. */

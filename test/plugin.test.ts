@@ -597,6 +597,56 @@ describe("hot path", () => {
     }
   }, 10_000)
 
+  test("an unreadable stored ranking is discarded once, not reported on every start", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "optimizer-plugin-"))
+    const dbPath = join(dir, "state.db")
+
+    try {
+      // A row that claims a fresh fetch but carries no ranking: the shape an
+      // interrupted write leaves behind.
+      const seed = new OptimizerDb(dbPath)
+      seed.saveRefresh("vendor/model", { survivors: ["alpha"], blacklist: [], computedAt: Date.now() }, Date.now())
+      seed.close()
+      const raw = new Database(dbPath)
+      raw.run("UPDATE fetches SET survivors_json = NULL, blacklist_json = NULL WHERE model = 'vendor/model'")
+      raw.close()
+
+      const warnings: string[] = []
+      const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+        warnings.push(args.map((arg) => String(arg)).join(" "))
+      })
+
+      try {
+        const { ctx } = makeCtx({})
+        const plugin = definePlugin({ dbPath, statsRun: async () => JSON.stringify({ models: [] }) } as never)
+        const cleanup = await plugin.setup!(ctx as never)
+        await cleanup?.()
+
+        expect(warnings.some((line) => line.includes("stored ranking is unreadable"))).toBe(true)
+
+        // The damaged row was reset, so it no longer claims to be freshly ranked.
+        const check = new OptimizerDb(dbPath)
+        const row = check.getFetch("vendor/model")
+        expect(row?.last_fetched).toBeNull()
+        expect(row?.survivors_json).toBeNull()
+        check.close()
+
+        // Second start: the row is clean now, so nothing is reported again.
+        warnings.length = 0
+        const { ctx: secondCtx } = makeCtx({})
+        const second = definePlugin({ dbPath, statsRun: async () => JSON.stringify({ models: [] }) } as never)
+        const secondCleanup = await second.setup!(secondCtx as never)
+        await secondCleanup?.()
+
+        expect(warnings.some((line) => line.includes("stored ranking is unreadable"))).toBe(false)
+      } finally {
+        spy.mockRestore()
+      }
+    } finally {
+      removeDir(dir)
+    }
+  }, 10_000)
+
   test("a non-JSON body passes through untouched and warns once", async () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     delete process.env.OPENROUTER_MANAGEMENT_KEY
