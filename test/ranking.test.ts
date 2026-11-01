@@ -35,23 +35,38 @@ describe("providerSlug", () => {
 
 describe("filterEndpoint", () => {
   test("drops providers without tool support", () => {
-    const reason = filterEndpoint(
+    const reasons = filterEndpoint(
       endpoint({ supported_parameters: ["response_format"], tag: "x1/fp8", provider_name: "x1" }),
       DEFAULT_OPTIONS,
     )
-    expect(reason).toBe("tools")
+    expect(reasons).toEqual(["tools"])
   })
 
   test("drops small context and tiny completion caps and low uptime", () => {
-    expect(filterEndpoint(endpoint({ context_length: 24_000 }), DEFAULT_OPTIONS)).toBe("context")
-    expect(filterEndpoint(endpoint({ max_completion_tokens: 4_096 }), DEFAULT_OPTIONS)).toBe("completion")
-    expect(filterEndpoint(endpoint({ uptime_last_30m: 80 }), DEFAULT_OPTIONS)).toBe("uptime")
+    expect(filterEndpoint(endpoint({ context_length: 24_000 }), DEFAULT_OPTIONS)).toEqual(["context"])
+    expect(filterEndpoint(endpoint({ max_completion_tokens: 4_096 }), DEFAULT_OPTIONS)).toEqual(["completion"])
+    expect(filterEndpoint(endpoint({ uptime_last_30m: 80 }), DEFAULT_OPTIONS)).toEqual(["uptime"])
   })
 
   test("drops endpoints with missing or unparseable pricing", () => {
-    expect(filterEndpoint(endpoint({ pricing: { prompt: "", completion: "" } }), DEFAULT_OPTIONS)).toBe("pricing")
-    expect(filterEndpoint(endpoint({ pricing: { prompt: "N/A", completion: "0.0000005" } }), DEFAULT_OPTIONS)).toBe("pricing")
-    expect(filterEndpoint(endpoint({ pricing: { prompt: "0.0000001", completion: "" } }), DEFAULT_OPTIONS)).toBe("pricing")
+    expect(filterEndpoint(endpoint({ pricing: { prompt: "", completion: "" } }), DEFAULT_OPTIONS)).toEqual(["pricing"])
+    expect(filterEndpoint(endpoint({ pricing: { prompt: "N/A", completion: "0.0000005" } }), DEFAULT_OPTIONS)).toEqual(["pricing"])
+    expect(filterEndpoint(endpoint({ pricing: { prompt: "0.0000001", completion: "" } }), DEFAULT_OPTIONS)).toEqual(["pricing"])
+  })
+
+  test("reports every failed check, not just the first", () => {
+    // Small context, low uptime and no tool support all fail on one endpoint.
+    expect(
+      filterEndpoint(
+        endpoint({ context_length: 24_000, uptime_last_30m: 40, supported_parameters: ["response_format"] }),
+        DEFAULT_OPTIONS,
+      ),
+    ).toEqual(["uptime", "context", "tools"])
+    // Low uptime plus a tiny completion cap.
+    expect(filterEndpoint(endpoint({ uptime_last_30m: 80, max_completion_tokens: 4_096 }), DEFAULT_OPTIONS)).toEqual([
+      "uptime",
+      "completion",
+    ])
   })
 
   test("drops an unparseable cache-write price but accepts an unknown cache-read price", () => {
@@ -60,17 +75,17 @@ describe("filterEndpoint", () => {
         endpoint({ pricing: { prompt: "0.0000001", completion: "0.0000005", input_cache_write: "N/A" } }),
         DEFAULT_OPTIONS,
       ),
-    ).toBe("pricing")
+    ).toEqual(["pricing"])
     expect(
       filterEndpoint(
         endpoint({ pricing: { prompt: "0.0000001", completion: "0.0000005", input_cache_read: "N/A" } }),
         DEFAULT_OPTIONS,
       ),
-    ).toBeUndefined()
+    ).toEqual([])
   })
 
   test("accepts a healthy endpoint", () => {
-    expect(filterEndpoint(endpoint(), DEFAULT_OPTIONS)).toBeUndefined()
+    expect(filterEndpoint(endpoint(), DEFAULT_OPTIONS)).toEqual([])
   })
 })
 
@@ -179,6 +194,38 @@ describe("rankProviders", () => {
     expect(ranking.blacklist).toEqual([])
     // h = 0.5: no cache discount, so cached and uncached input both bill at 1e-7.
     expect(ranking.rankings[0].perRequest).toBeCloseTo(10_000 * 0.0000001 + 1_000 * 0.0000001)
+  })
+
+  test("blacklistReasons explains every blocked provider, with all reasons listed", () => {
+    const options = { ...DEFAULT_OPTIONS, extraIgnore: ["zed"] }
+    const ranking = rankProviders(endpoints, profile, options)
+    expect(ranking.blacklist).toEqual(["alpha", "epsilon", "theta", "zed"])
+    // alpha/epsilon lose the price race, theta fails the uptime filter, zed is the
+    // user's explicit instruction.
+    expect(ranking.blacklistReasons).toEqual({
+      alpha: ["not-cheapest"],
+      epsilon: ["not-cheapest"],
+      theta: ["uptime"],
+      zed: ["extra-ignore"],
+    })
+  })
+
+  test("blacklistReasons lists multiple reasons for a provider with several causes", () => {
+    const options = { ...DEFAULT_OPTIONS, extraIgnore: ["alpha"] }
+    const ranking = rankProviders(endpoints, profile, options)
+    // alpha is both too expensive for topN and explicitly ignored.
+    expect(ranking.blacklist).toContain("alpha")
+    expect(ranking.blacklistReasons?.alpha).toEqual(["not-cheapest", "extra-ignore"])
+  })
+
+  test("blacklistReasons reasons filters before pricing and covers every blacklist entry", () => {
+    const junk = endpoint({ provider_name: "junk", tag: "junk/fp8", pricing: { prompt: "", completion: "" } })
+    const ranking = rankProviders([junk, ...endpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.blacklistReasons?.junk).toEqual(["pricing"])
+    for (const slug of ranking.blacklist) {
+      expect(ranking.blacklistReasons?.[slug]).not.toBeNull()
+      expect((ranking.blacklistReasons?.[slug] ?? []).length).toBeGreaterThan(0)
+    }
   })
 })
 
@@ -325,5 +372,16 @@ describe("free-priority mode", () => {
     expect(ranking.mode).toBe("free")
     expect(ranking.survivors).toEqual(["f1", "f2", "f3", "f4"])
     expect(ranking.blacklist).toEqual([])
+  })
+
+  test("blacklistReasons reports paid-in-free-mode and skips non-blacklisted slugs", () => {
+    const ranking = rankProviders([...paidEndpoints, ...freeEndpoints], profile, DEFAULT_OPTIONS)
+    expect(ranking.mode).toBe("free")
+    expect(ranking.blacklist).toEqual(["alpha", "beta", "gamma"])
+    expect(ranking.blacklistReasons).toEqual({
+      alpha: ["paid"],
+      beta: ["paid"],
+      gamma: ["paid"],
+    })
   })
 })

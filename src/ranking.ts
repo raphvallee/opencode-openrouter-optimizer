@@ -40,26 +40,31 @@ export interface Filtered {
   reason?: string
 }
 
-/** Drop endpoints that would break OpenCode sessions, be cursed for quality, or have unknown pricing. */
-export function filterEndpoint(endpoint: OpenRouterEndpoint, options: OptimizerOptions): string | undefined {
-  if (endpoint.status !== 0 && endpoint.status !== null && endpoint.status !== undefined) return "status"
-  if (!hasKnownPricing(endpoint.pricing)) return "pricing"
+/**
+ * Drop endpoints that would break OpenCode sessions, be cursed for quality, or have unknown
+ * pricing. Returns every failed check (not just the first) so the debug print can show the
+ * full diagnosis; an empty array means the endpoint passed all filters.
+ */
+export function filterEndpoint(endpoint: OpenRouterEndpoint, options: OptimizerOptions): string[] {
+  const reasons: string[] = []
+  if (endpoint.status !== 0 && endpoint.status !== null && endpoint.status !== undefined) reasons.push("status")
+  if (!hasKnownPricing(endpoint.pricing)) reasons.push("pricing")
   const uptime = endpoint.uptime_last_30m ?? endpoint.uptime_last_1d ?? 100
-  if (uptime < options.minUptimePercent) return "uptime"
+  if (uptime < options.minUptimePercent) reasons.push("uptime")
   if (endpoint.toolCallErrorRate !== undefined && endpoint.toolCallErrorRate > options.maxToolCallErrorRate) {
-    return "tool-errors"
+    reasons.push("tool-errors")
   }
-  if (endpoint.context_length !== null && endpoint.context_length < options.minContextLength) return "context"
-  if (
-    endpoint.max_completion_tokens !== null &&
-    endpoint.max_completion_tokens < options.minMaxCompletionTokens
-  )
-    return "completion"
+  if (endpoint.context_length !== null && endpoint.context_length < options.minContextLength) {
+    reasons.push("context")
+  }
+  if (endpoint.max_completion_tokens !== null && endpoint.max_completion_tokens < options.minMaxCompletionTokens) {
+    reasons.push("completion")
+  }
   if (options.requireToolSupport) {
     const params = endpoint.supported_parameters ?? []
-    if (!params.includes("tools") || !params.includes("tool_choice")) return "tools"
+    if (!params.includes("tools") || !params.includes("tool_choice")) reasons.push("tools")
   }
-  return undefined
+  return reasons
 }
 
 export interface ProviderRank {
@@ -80,8 +85,9 @@ export interface Ranking {
   survivors: string[]
   blacklist: string[]
   /**
-   * slug -> reasons it was blacklisted (all of them, one entry per cause), only
-   * built when options.debugBlacklistReasons is on: debug-only payload.
+   * slug -> reasons it was blacklisted (all of them, one entry per cause). Always
+   * built: reasons are stored with every ranking, so turning the debug option on
+   * later works immediately instead of showing nothing until the next re-rank.
    */
   blacklistReasons?: Record<string, string[]>
   profile: RequestProfile
@@ -111,11 +117,10 @@ export function rankProviders(
 ): Ranking {
   const now = Date.now()
 
-  // Blacklist reasons are debug-only payload: built exclusively when the option is
-  // on, so the hot path stays clean when debugBlacklistReasons is off.
-  const reasonMap = options.debugBlacklistReasons ? new Map<string, Set<string>>() : undefined
+  // slug -> block causes. Always built: the payload is tiny, and persisting it with
+  // every ranking is what makes debugBlacklistReasons useful on a stored ranking.
+  const reasonMap = new Map<string, Set<string>>()
   const addReason = (slug: string, reason: string) => {
-    if (!reasonMap) return
     const existing = reasonMap.get(slug)
     if (existing) existing.add(reason)
     else reasonMap.set(slug, new Set([reason]))
@@ -128,10 +133,10 @@ export function rankProviders(
   for (const endpoint of endpoints) {
     const slug = providerSlug(endpoint)
     if (!slug) continue
-    const filterReason = filterEndpoint(endpoint, options)
-    if (filterReason !== undefined) {
+    const filterReasons = filterEndpoint(endpoint, options)
+    if (filterReasons.length > 0) {
       filteredSlugs.add(slug)
-      addReason(slug, filterReason)
+      for (const filterReason of filterReasons) addReason(slug, filterReason)
       continue
     }
     eligible.push({ endpoint, slug })
@@ -187,24 +192,21 @@ export function rankProviders(
         ].filter((slug) => !survivorSet.has(slug))),
       ]
 
-  let blacklistReasons: Record<string, string[]> | undefined
-  if (reasonMap) {
-    // Ranked-but-not-surviving slugs are blocked by price (topN in cheapest mode,
-    // paid-in-free-mode otherwise); extraIgnore is the user's explicit instruction.
-    const priceReason = freeMode ? "paid" : "not-cheapest"
-    for (const { slug } of eligible) {
-      if (!survivorSet.has(slug)) addReason(slug, priceReason)
-    }
-    for (const slug of options.extraIgnore) {
-      addReason(slug, "extra-ignore")
-    }
-    // Keep the blacklist's order and only include slugs that are actually blocked:
-    // a slug can carry filter + price + extraIgnore reasons at once.
-    blacklistReasons = {}
-    for (const slug of blacklist) {
-      const reasons = reasonMap.get(slug)
-      if (reasons && reasons.size > 0) blacklistReasons[slug] = [...reasons]
-    }
+  // Ranked-but-not-surviving slugs are blocked by price (topN in cheapest mode,
+  // paid-in-free-mode otherwise); extraIgnore is the user's explicit instruction.
+  const priceReason = freeMode ? "paid" : "not-cheapest"
+  for (const { slug } of eligible) {
+    if (!survivorSet.has(slug)) addReason(slug, priceReason)
+  }
+  for (const slug of options.extraIgnore) {
+    addReason(slug, "extra-ignore")
+  }
+  // Keep the blacklist's order and only include slugs that are actually blocked:
+  // a slug can carry filter + price + extraIgnore reasons at once.
+  const blacklistReasons: Record<string, string[]> = {}
+  for (const slug of blacklist) {
+    const reasons = reasonMap.get(slug)
+    if (reasons && reasons.size > 0) blacklistReasons[slug] = [...reasons]
   }
 
   return {
@@ -212,7 +214,7 @@ export function rankProviders(
     rankings: ordered,
     survivors,
     blacklist,
-    ...(blacklistReasons ? { blacklistReasons } : {}),
+    blacklistReasons,
     profile,
     computedAt: now,
   }

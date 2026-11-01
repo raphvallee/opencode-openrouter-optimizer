@@ -81,6 +81,64 @@ describe("OptimizerDb", () => {
     }
   })
 
+  test("saveRefresh stores blacklist reasons and loadRoutingStates reads them back", () => {
+    const db = new OptimizerDb(":memory:")
+    try {
+      db.saveRefresh(
+        "vendor/model",
+        { survivors: ["a"], blacklist: ["b", "c"], computedAt: 10, mode: "cheapest" },
+        20,
+        undefined,
+        { b: ["uptime", "not-cheapest"], c: ["pricing"] },
+      )
+      const states = db.loadRoutingStates()
+      expect(states.find((state) => state.model === "vendor/model")?.blacklistReasons).toEqual({
+        b: ["uptime", "not-cheapest"],
+        c: ["pricing"],
+      })
+      expect(db.getRankings("vendor/model")?.blacklistReasons).toEqual({
+        b: ["uptime", "not-cheapest"],
+        c: ["pricing"],
+      })
+      // A lean load skips the debug payload but keeps routing intact.
+      const lean = db.loadRoutingStates(false).find((state) => state.model === "vendor/model")
+      expect(lean?.routing).toEqual({ survivors: ["a"], blacklist: ["b", "c"], computedAt: 10, mode: "cheapest" })
+      expect(lean?.blacklistReasons).toBeUndefined()
+
+      // Refreshes without reasons clear the column instead of keeping stale data.
+      db.saveRefresh("vendor/model", { survivors: ["a"], blacklist: [], computedAt: 30 }, 40)
+      expect(db.getFetch("vendor/model")?.blacklist_reasons_json).toBeNull()
+    } finally {
+      db.close()
+    }
+  })
+
+  test("a corrupt blacklist_reasons_json reads as missing reasons without breaking routing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "optimizer-db-"))
+    const path = join(dir, "corrupt-reasons.db")
+    const db = new OptimizerDb(path)
+    try {
+      db.saveRefresh(
+        "vendor/model",
+        { survivors: ["a"], blacklist: ["b"], computedAt: 10, mode: "cheapest" },
+        20,
+        undefined,
+        { b: ["uptime"] },
+      )
+      const raw = new Database(path)
+      raw.run("UPDATE fetches SET blacklist_reasons_json = '{not json' WHERE model = 'vendor/model'")
+      raw.close()
+
+      const state = db.loadRoutingStates().find((row) => row.model === "vendor/model")!
+      // Reasons are debug-only payload: their corruption never affects routing.
+      expect(state.routing).toEqual({ survivors: ["a"], blacklist: ["b"], computedAt: 10, mode: "cheapest" })
+      expect(state.blacklistReasons).toBeUndefined()
+    } finally {
+      db.close()
+      removeDir(dir)
+    }
+  })
+
   test("a corrupt survivors_json reads as never ranked, a valid empty one as zero survivors", () => {
     const dir = mkdtempSync(join(tmpdir(), "optimizer-db-"))
     const path = join(dir, "corrupt.db")

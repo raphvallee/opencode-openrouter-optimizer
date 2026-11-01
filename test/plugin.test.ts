@@ -290,6 +290,81 @@ describe("http.request hook", () => {
       else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
     }
   }, 10_000)
+
+  test("debugBlacklistReasons groups providers by identical reason sets", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
+    const groupedPayload = () => ({
+      data: {
+        id: "vendor/model",
+        name: "Vendor Model",
+        endpoints: [
+          { name: "A | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000001", completion: "0.0000002" }, provider_name: "A", tag: "alpha/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 99 },
+          { name: "B | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000002", completion: "0.0000003" }, provider_name: "B", tag: "beta/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 99 },
+          { name: "G | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000003", completion: "0.0000004" }, provider_name: "G", tag: "gamma/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 99 },
+          { name: "E | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.000001", completion: "0.000002" }, provider_name: "E", tag: "epsilon/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 99 },
+          // Two providers sharing the same filter failure group on "uptime".
+          { name: "U1 | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000001", completion: "0.0000002" }, provider_name: "U1", tag: "u-one/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 40 },
+          { name: "U2 | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000001", completion: "0.0000002" }, provider_name: "U2", tag: "u-two/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 50 },
+          // A provider whose reason set differs from both groups.
+          { name: "C | m", model_id: "vendor/model", context_length: 24_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000001", completion: "0.0000002" }, provider_name: "C", tag: "c-small/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 99 },
+        ],
+      },
+    })
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(groupedPayload()), { status: 200 }))
+      return realFetch(input as never, init)
+    }) as typeof fetch
+
+    const logs: string[] = []
+    const spy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(" "))
+    })
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({
+        dbPath: ":memory:",
+        debug: true,
+        debugBlacklistReasons: true,
+        statsRun: async () => JSON.stringify({ models: [] }),
+      } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      const handler = hooks.get("http.request")!.handler
+
+      const evt1 = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+      await handler(evt1)
+
+      // Poll until the background refresh has written a ranking with reasons.
+      let reasonsHeader: string | undefined
+      for (let attempt = 0; attempt < 40 && !reasonsHeader; attempt++) {
+        await sleep(25)
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+        reasonsHeader = logs.find((line) => line.includes("providers blocked for vendor/model"))
+      }
+
+      // epsilon alone loses the price race; u-one/u-two share the uptime filter failure
+      // and are grouped; c-small has its own context failure. One group per line,
+      // indented under the header to show they belong to the routing request.
+      expect(reasonsHeader).toContain("providers blocked for vendor/model")
+      const groupLines = logs.filter((line) => line.includes(": u-one, u-two") || line.includes(": epsilon") || line.includes(": c-small"))
+      expect(groupLines.some((line) => line.includes("not-cheapest: epsilon"))).toBe(true)
+      expect(groupLines.some((line) => line.includes("uptime: u-one, u-two"))).toBe(true)
+      expect(groupLines.some((line) => line.includes("context: c-small"))).toBe(true)
+      expect(groupLines.some((line) => line.includes("unknown"))).toBe(false)
+
+      await cleanup?.()
+    } finally {
+      spy.mockRestore()
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
 })
 
 describe("hot path", () => {
