@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { baseModelSlug, fetchModelEndpoints, OpenRouterError } from "../src/openrouter"
+import { baseModelSlug, fetchModelEndpoints, fetchOpenRouterProfile, OpenRouterError } from "../src/openrouter"
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
@@ -89,5 +89,39 @@ describe("fetchModelEndpoints", () => {
         }),
     })
     await expect(failure).rejects.toBeDefined()
+  })
+})
+
+describe("fetchOpenRouterProfile", () => {
+  test("reduces activity rows for the model across variant suffixes", async () => {
+    const activity = await fetchOpenRouterProfile("vendor/model", "key", {
+      fetchImpl: async () =>
+        jsonResponse([
+          {
+            date: "2026-01-01",
+            model: "vendor/model:reasoning",
+            requests: 2,
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cached_tokens: 20,
+          },
+          { date: "2026-01-01", model: "other/model", requests: 9, prompt_tokens: 999, completion_tokens: 9 },
+        ]),
+    })
+    expect(activity).toEqual({ requests: 2, promptTokens: 100, completionTokens: 10, cachedTokens: 20 })
+  })
+
+  test("throws on an unrecognized activity envelope instead of silently ranking from zero rows", async () => {
+    const failure = fetchOpenRouterProfile("vendor/model", "key", {
+      fetchImpl: async () => jsonResponse({ unexpected: true }),
+    })
+    await expect(failure).rejects.toBeInstanceOf(OpenRouterError)
+  })
+
+  test("an empty data envelope is a legitimate zero-activity result", async () => {
+    const activity = await fetchOpenRouterProfile("vendor/model", "key", {
+      fetchImpl: async () => jsonResponse({ data: [] }),
+    })
+    expect(activity).toEqual({ requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0 })
   })
 })

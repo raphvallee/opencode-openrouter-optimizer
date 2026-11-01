@@ -103,19 +103,38 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       // through unrouted, which must not be invisible.
       const unroutedWarned = new Set<string>()
 
+      // Same notice class: a ranking persisted with no usage data at all prices
+      // endpoints with a guessed token profile, which can rank the wrong
+      // providers cheapest. One notice per model keeps a fresh install quiet
+      // after its first refresh.
+      const unprofiledWarned = new Set<string>()
+
+      // Activity data silently disappears when the management key is unset; one
+      // notice explains where the ranking's numbers come from instead.
+      let activityKeyWarned = false
+
       // Hot path state: warm the cache once, then every request is a map lookup.
       // The DB stays durable; another process may refresh behind us, which is bounded
       // by the same TTL the routing decisions already use.
       const routes = new Map<string, RoutingState>()
+
+      /** A row that claims a fresh ranking but carries no readable one is damage: say so once. */
+      function adoptState(state: RoutingState): RoutingState {
+        if (state.lastFetched !== null && !state.routing) {
+          warn(`${state.model}: stored ranking is unreadable, the next request will re-rank`)
+        }
+        return state
+      }
+
       for (const state of db.loadRoutingStates(options.debug)) {
-        routes.set(state.model, state)
+        routes.set(state.model, adoptState(state))
       }
 
       /** Resolve one model's state, reading the DB at most once per process. */
       function stateFor(model: string, now: number): RoutingState {
         const cached = routes.get(model)
         if (cached) return cached
-        const state = routingStateFromRow(db.ensureFetchRow(model, now), options.debug)
+        const state = adoptState(routingStateFromRow(db.ensureFetchRow(model, now), options.debug))
         routes.set(model, state)
         return state
       }
@@ -125,12 +144,21 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         // Both sources run concurrently in the background task; both snapshots are
         // cached and single-flighted across models.
         const key = managementKey()
+        if (!key && !activityKeyWarned) {
+          activityKeyWarned = true
+          warn(`${options.managementKeyEnv} is not set: OpenRouter activity data is unused, ranking relies on OpenCode stats and defaults`)
+        }
         const [statsResult, remoteResult] = await Promise.allSettled([
           stats.get(),
           key ? fetchOpenRouterProfile(model, key, { signal: controller.signal }) : Promise.resolve(undefined),
         ])
         let local: LocalProfile | undefined
         if (statsResult.status === "fulfilled") local = stats.pick(model)
+        else {
+          // get() never rejects today; if that guarantee ever breaks, say so
+          // instead of silently ranking from defaults.
+          warn(`opencode stats lookup failed for ${model}:`, statsResult.reason instanceof Error ? statsResult.reason.message : statsResult.reason)
+        }
         let remote
         if (key) {
           if (remoteResult.status === "fulfilled") remote = remoteResult.value
@@ -158,6 +186,14 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           // for the whole TTL. A completed endpoints fetch does not make it valid.
           if (controller.signal.aborted) return
 
+          // A ranking computed from zero usage data prices every endpoint with
+          // the default token profile. Endpoints are still real, so the routing
+          // is kept, but the guesswork must not be invisible.
+          if (profile.numRequests === 0 && !unprofiledWarned.has(model)) {
+            unprofiledWarned.add(model)
+            warn(`${model}: no usage data available, ranking uses the default token profile`)
+          }
+
           // Tool Call Error Rate: optional data, fetched only when the filter is on.
           // Failures are swallowed: ranking proceeds without the filter instead of
           // blocking every provider on a flaky stats route. The permaslug comes from
@@ -178,6 +214,8 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
                 if (isAbortError(error)) throw error
                 debug("tool call error rate unavailable, ranking without it:", error)
               }
+            } else {
+              debug("tool call error rate skipped: the endpoints payload carries no permaslug")
             }
           }
 
@@ -374,8 +412,11 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         try {
           body = JSON.parse(raw) as { model?: unknown }
           model = typeof (body as { model?: unknown }).model === "string" ? ((body as { model?: string }).model ?? "") : ""
-        } catch {
-          // A non-JSON body cannot carry routing. Leave the original request untouched.
+        } catch (error) {
+          // A non-JSON body cannot carry routing. Leave the original request
+          // untouched, but leave a trace: an unnoticed body-format change would
+          // otherwise disable routing with zero signal.
+          debug("request body is not JSON, routing skipped:", error instanceof Error ? error.message : error)
           return
         }
 

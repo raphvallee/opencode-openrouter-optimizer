@@ -5,6 +5,15 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { OptimizerDb } from "../src/db"
 
+/** Windows keeps SQLite WAL handles briefly after close; removal is best-effort. */
+function removeDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+  } catch {
+    // The temp dir is disposable; a lingering lock must not fail the test.
+  }
+}
+
 describe("OptimizerDb", () => {
   test("ensureFetchRow leaves last_fetched null on first sight", () => {
     const db = new OptimizerDb(":memory:")
@@ -69,6 +78,34 @@ describe("OptimizerDb", () => {
       expect(db.loadRoutingStates(false).find((state) => state.model === "vendor/lean")?.details).toBeUndefined()
     } finally {
       db.close()
+    }
+  })
+
+  test("a corrupt survivors_json reads as never ranked, a valid empty one as zero survivors", () => {
+    const dir = mkdtempSync(join(tmpdir(), "optimizer-db-"))
+    const path = join(dir, "corrupt.db")
+    const db = new OptimizerDb(path)
+    try {
+      db.saveRefresh("vendor/model", { survivors: ["a"], blacklist: ["b"], computedAt: 10 }, 20)
+      db.saveRefresh("vendor/empty", { survivors: [], blacklist: [], computedAt: 10 }, 20)
+      // Corrupt one row out-of-band, the way disk corruption would.
+      const raw = new Database(path)
+      raw.run("UPDATE fetches SET survivors_json = '{not json' WHERE model = 'vendor/model'")
+      raw.close()
+
+      const states = db.loadRoutingStates(false)
+      const corrupt = states.find((state) => state.model === "vendor/model")!
+      // The row still claims to be fresh, but routing is gone: the plugin then
+      // forces a re-rank on the next request instead of passing requests
+      // through unrouted for the whole TTL.
+      expect(corrupt.lastFetched).toBe(20)
+      expect(corrupt.routing).toBeUndefined()
+      // A legitimately empty ranking keeps its routing snapshot.
+      const empty = states.find((state) => state.model === "vendor/empty")!
+      expect(empty.routing).toEqual({ survivors: [], blacklist: [], computedAt: 10, mode: "cheapest" })
+    } finally {
+      db.close()
+      removeDir(dir)
     }
   })
 

@@ -1,5 +1,19 @@
+import { Database } from "bun:sqlite"
 import { describe, expect, spyOn, test } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { definePlugin } from "../src/plugin"
+import { OptimizerDb } from "../src/db"
+
+/** Windows keeps SQLite WAL handles briefly after close; removal is best-effort. */
+function removeDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+  } catch {
+    // The temp dir is disposable; a lingering lock must not fail the test.
+  }
+}
 
 const ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/vendor/model/endpoints"
 
@@ -438,6 +452,251 @@ describe("hot path", () => {
       await cleanup?.()
     } finally {
       spy.mockRestore()
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
+  test("a corrupt stored ranking is re-ranked on the next request instead of passing through unrouted", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
+    const dir = mkdtempSync(join(tmpdir(), "optimizer-plugin-"))
+    const dbPath = join(dir, "state.db")
+    let endpointCalls = 0
+
+    try {
+      // Seed a valid ranking, then corrupt it out-of-band, the way disk
+      // corruption or an interrupted write would.
+      const seed = new OptimizerDb(dbPath)
+      seed.saveRefresh("vendor/model", { survivors: [], blacklist: [], computedAt: Date.now() }, Date.now())
+      seed.close()
+      const raw = new Database(dbPath)
+      raw.run("UPDATE fetches SET survivors_json = '{not json' WHERE model = 'vendor/model'")
+      raw.close()
+
+      const warnings: string[] = []
+      const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+        warnings.push(args.map((arg) => String(arg)).join(" "))
+      })
+
+      globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+        if (url === ENDPOINTS_URL) {
+          endpointCalls++
+          return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+        }
+        return realFetch(input as never, init)
+      }) as typeof fetch
+
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({ dbPath, statsRun: async () => JSON.stringify({ models: [] }) } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+
+      try {
+        // Warm-up already saw the damage and said so.
+        expect(warnings.some((line) => line.includes("stored ranking is unreadable"))).toBe(true)
+
+        const handler = hooks.get("http.request")!.handler
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+
+        // The corrupt row reads as "never ranked", so the request waited for a
+        // forced re-rank instead of passing through unrouted for the whole TTL.
+        expect(endpointCalls).toBe(1)
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { ignore?: string[]; sort?: string }
+        }
+        expect(parsed.provider?.ignore).toEqual(["epsilon"])
+      } finally {
+        spy.mockRestore()
+        await cleanup?.()
+      }
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+      removeDir(dir)
+    }
+  }, 10_000)
+
+  test("a non-JSON body passes through untouched", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      return realFetch(input as never, init)
+    }) as typeof fetch
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({ dbPath: ":memory:", statsRun: async () => JSON.stringify({ models: [] }) } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      try {
+        const handler = hooks.get("http.request")!.handler
+        const evt = {
+          request: new Request("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "not json at all",
+          }),
+          model: { providerID: "openrouter", modelID: "vendor/model" },
+          kind: "primary",
+        }
+        await handler(evt)
+        // Untouched: the original body goes out byte-for-byte.
+        expect(await (evt as { request: Request }).request.text()).toBe("not json at all")
+      } finally {
+        await cleanup?.()
+      }
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
+  test("a missing permaslug skips the tool call error rate probe and still routes", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const urls: string[] = []
+    // Endpoint names without the "Provider | permaslug" tail: no permaslug can
+    // be recovered, so the frontend stats probe must never be attempted.
+    const noPermaslugPayload = {
+      data: {
+        id: "vendor/model",
+        name: "Vendor Model",
+        endpoints: [
+          { name: "A", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000001", completion: "0.0000002" }, provider_name: "A", tag: "alpha/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 99 },
+          { name: "B", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000002", completion: "0.0000003" }, provider_name: "B", tag: "beta/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 99 },
+        ],
+      },
+    }
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      urls.push(url)
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(noPermaslugPayload), { status: 200 }))
+      // Any stats attempt would land here and fail the assertions below.
+      if (url.includes("/api/frontend/")) {
+        return Promise.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 }))
+      }
+      return savedFetch.bind(globalThis)(input as never, init)
+    }) as typeof fetch
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({ dbPath: ":memory:", statsRun: async () => JSON.stringify({ models: [] }) } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      try {
+        const handler = hooks.get("http.request")!.handler
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+        // The filter is silently off, but routing still works.
+        expect(urls.some((u) => u.includes("/api/frontend/"))).toBe(false)
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { ignore?: string[]; sort?: string }
+        }
+        expect(parsed.provider?.sort).toBe("price")
+      } finally {
+        await cleanup?.()
+      }
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
+  test("a missing management key and empty usage data are warned once", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    const realFetch = withStatsFallback(savedFetch.bind(globalThis))
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("/models/vendor/model/endpoints")) {
+        return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      }
+      if (url.includes("/models/vendor/other/endpoints")) {
+        return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      }
+      return realFetch(input as never, init)
+    }) as typeof fetch
+
+    const warnings: string[] = []
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    })
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({ dbPath: ":memory:", statsRun: async () => JSON.stringify({ models: [] }) } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      try {
+        const handler = hooks.get("http.request")!.handler
+        // Two models, two refreshes: the key notice fires once, the
+        // no-usage-data notice once per model.
+        await handler({ request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" })
+        await handler({ request: openRouterRequest("vendor/other"), model: { providerID: "openrouter" }, kind: "primary" })
+
+        expect(warnings.filter((line) => line.includes("OPENROUTER_MANAGEMENT_KEY is not set")).length).toBe(1)
+        expect(warnings.filter((line) => line.includes("no usage data available")).length).toBe(2)
+      } finally {
+        spy.mockRestore()
+        await cleanup?.()
+      }
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
+  test("an unrecognized activity envelope degrades loudly and still routes", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    process.env.OPENROUTER_MANAGEMENT_KEY = "test-key"
+    const savedFetch = globalThis.fetch
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(endpointsPayload()), { status: 200 }))
+      if (url.includes("/activity")) {
+        return Promise.resolve(new Response(JSON.stringify({ unexpected: true }), { status: 200 }))
+      }
+      return savedFetch.bind(globalThis)(input as never, init)
+    }) as typeof fetch
+
+    const warnings: string[] = []
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    })
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({ dbPath: ":memory:", statsRun: async () => JSON.stringify({ models: [] }) } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      try {
+        const handler = hooks.get("http.request")!.handler
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+
+        // The drift surfaces through the existing activity-failure warning.
+        expect(warnings.some((line) => line.includes("activity fetch failed"))).toBe(true)
+        // And the request is still routed from the remaining sources.
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { ignore?: string[]; sort?: string }
+        }
+        expect(parsed.provider?.ignore).toEqual(["epsilon"])
+      } finally {
+        spy.mockRestore()
+        await cleanup?.()
+      }
+    } finally {
       globalThis.fetch = savedFetch
       if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
       else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv

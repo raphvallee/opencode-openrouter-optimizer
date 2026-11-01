@@ -42,10 +42,17 @@ export function parseStatsModels(json: string): Map<string, LocalProfile> {
   let models: unknown
   try {
     models = (JSON.parse(json) as { models?: unknown })?.models
-  } catch {
-    return profiles
+  } catch (error) {
+    // Shape drift must surface like a command failure (get()'s catch feeds the
+    // plugin's warn-once channel): a silently empty map would rank every model
+    // from fallbacks with no signal that the CLI output format changed.
+    throw new Error(`opencode stats output is not valid JSON: ${error instanceof Error ? error.message : error}`)
   }
-  if (!Array.isArray(models)) return profiles
+  if (!Array.isArray(models)) {
+    // A missing models array is drift; an empty one is a legitimate fresh
+    // install and still parses below.
+    throw new Error("opencode stats output is missing the models array")
+  }
   for (const row of models as StatsModelRow[]) {
     const id = typeof row?.model?.id === "string" ? row.model.id : undefined
     if (!id) continue

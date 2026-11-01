@@ -46,10 +46,15 @@ describe("parseStatsModels", () => {
     expect(profile.totalOutput).toBe(850)
   })
 
-  test("tolerates junk payloads and malformed rows", () => {
-    expect(parseStatsModels("not json").size).toBe(0)
-    expect(parseStatsModels("{}").size).toBe(0)
+  test("throws on shape drift but tolerates malformed rows", () => {
+    // Drift must surface (get()'s catch feeds the plugin's warn-once channel)
+    // instead of silently ranking every model from fallbacks.
+    expect(() => parseStatsModels("not json")).toThrow(/not valid JSON/)
+    expect(() => parseStatsModels("{}")).toThrow(/missing the models array/)
+    // A well-formed envelope with junk rows is "no data", not drift.
     expect(parseStatsModels('{"models": [null, {}, {"model": {"id": 5}}]}').size).toBe(0)
+    // An empty models array is a legitimate fresh-install state.
+    expect(parseStatsModels('{"models": []}').size).toBe(0)
   })
 
   test("rows without a usable steps count contribute no tokens", () => {

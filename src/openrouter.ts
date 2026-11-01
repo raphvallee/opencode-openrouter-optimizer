@@ -101,13 +101,19 @@ export async function fetchModelEndpoints(model: string, options: FetchOptions =
   return data
 }
 
-function extractRows(payload: unknown): ActivityRow[] {
+/**
+ * Activity rows from the known envelope shapes. Returns undefined when the
+ * payload matches none of them, so envelope drift surfaces as an
+ * OpenRouterError (and the plugin's activity-failure warning) instead of
+ * silently ranking from zero activity data.
+ */
+function extractRows(payload: unknown): ActivityRow[] | undefined {
   if (Array.isArray(payload)) return payload as ActivityRow[]
-  const data = (payload as { data?: unknown })?.data
+  const data = (payload as { data?: unknown } | null)?.data
   if (Array.isArray(data)) return data as ActivityRow[]
-  const nested = (data as { data?: unknown })?.data
+  const nested = (data as { data?: unknown } | null)?.data
   if (Array.isArray(nested)) return nested as ActivityRow[]
-  return []
+  return undefined
 }
 
 /**
@@ -132,6 +138,9 @@ export async function fetchOpenRouterProfile(
   }
   const payload = await response.json()
   const rows = extractRows(payload)
+  if (!rows) {
+    throw new OpenRouterError(`unexpected activity payload for ${model}`, response.status)
+  }
   const target = baseModelSlug(model).toLowerCase()
   return sumActivity(rows, target)
 }

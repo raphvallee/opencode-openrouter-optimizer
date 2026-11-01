@@ -105,6 +105,24 @@ function parseArray(json: string | null): string[] {
   }
 }
 
+/**
+ * Strict variant for survivors_json. Corrupt or non-array JSON returns null
+ * instead of [], so a damaged row reads as "never ranked": routing becomes
+ * undefined and the next request forces a re-rank, instead of a phantom
+ * zero-survivor ranking silently passing requests through unrouted for the
+ * whole TTL. A legitimately empty ranking still parses as [] and keeps its
+ * routing snapshot.
+ */
+function parseSurvivors(json: string | null): string[] | null {
+  if (json === null) return null
+  try {
+    const parsed = JSON.parse(json)
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : null
+  } catch {
+    return null
+  }
+}
+
 function parseDetails(json: string | null): unknown[] | undefined {
   if (!json) return undefined
   try {
@@ -121,15 +139,16 @@ function modeOf(value: string | null): "free" | "cheapest" {
 
 /** Build the in-memory state from a stored row. Parsing stays in one place. */
 export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingState {
-  const survivors = parseArray(row.survivors_json)
-  const routing: RoutingSnapshot | undefined = row.survivors_json
-    ? {
-        survivors,
-        blacklist: parseArray(row.blacklist_json),
-        computedAt: row.computed_at ?? row.updated_at,
-        mode: modeOf(row.mode),
-      }
-    : undefined
+  const survivors = parseSurvivors(row.survivors_json)
+  const routing: RoutingSnapshot | undefined =
+    survivors !== null
+      ? {
+          survivors,
+          blacklist: parseArray(row.blacklist_json),
+          computedAt: row.computed_at ?? row.updated_at,
+          mode: modeOf(row.mode),
+        }
+      : undefined
   return {
     model: row.model,
     lastFetched: row.last_fetched,
