@@ -121,10 +121,12 @@ export function rankProviders(
   }
 
   // 2) Free detection (slug level: one free alias is enough for the provider).
+  //    Classified at the tier the workload bills: an endpoint free below a
+  //    context-size threshold is paid above it, and vice versa.
   const freeSlugs = new Set<string>()
   if (options.preferFreeProviders) {
     for (const { endpoint, slug } of eligible) {
-      if (isFreePricing(endpoint.pricing)) freeSlugs.add(slug)
+      if (isFreePricing(endpoint.pricing, profile.avgInput)) freeSlugs.add(slug)
     }
   }
   const freeMode = freeSlugs.size > 0

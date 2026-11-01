@@ -142,3 +142,197 @@ describe("isFreePricing", () => {
     expect(isFreePricing({ prompt: "0", completion: "0", input_cache_write: -1 })).toBe(false)
   })
 })
+
+describe("tiered pricing (context-size overrides)", () => {
+  // OpenAI: GPT-6 Luna's real rates: base tier below 272K prompt tokens, a pricier
+  // long-context tier strictly above it.
+  const luna = {
+    prompt: "0.00000005", // $0.05/M
+    completion: "0.00000025", // $0.25/M
+    input_cache_read: "0.000000005",
+    input_cache_write: "0.0000000625",
+    discount: 0,
+    overrides: [
+      {
+        min_prompt_tokens: 272_000,
+        prompt: "0.0000001", // $0.10/M
+        completion: "0.000000375", // $0.375/M
+        input_cache_read: "0.00000001",
+        input_cache_write: "0.000000125",
+      },
+    ],
+  }
+
+  test("applies the long-context tier above the threshold", () => {
+    const rates = effectiveRates(luna, 300_000)
+    expect(rates.inputRate).toBeCloseTo(0.0000001)
+    expect(rates.outputRate).toBeCloseTo(0.000000375)
+    expect(rates.readRate).toBeCloseTo(0.00000001)
+    expect(rates.writeRate).toBeCloseTo(0.000000125)
+  })
+
+  test("stays on the base tier at or below the threshold (strictly greater)", () => {
+    for (const contextSize of [0, 271_999, 272_000]) {
+      const rates = effectiveRates(luna, contextSize)
+      expect(rates.inputRate).toBeCloseTo(0.00000005)
+      expect(rates.outputRate).toBeCloseTo(0.00000025)
+      expect(rates.readRate).toBeCloseTo(0.000000005)
+      expect(rates.writeRate).toBeCloseTo(0.0000000625)
+    }
+  })
+
+  test("without a context size the base tier is used", () => {
+    const rates = effectiveRates(luna)
+    expect(rates.inputRate).toBeCloseTo(0.00000005)
+    expect(rates.outputRate).toBeCloseTo(0.00000025)
+  })
+
+  test("the endpoint discount applies to tier rates too", () => {
+    const rates = effectiveRates({ ...luna, discount: 0.5 }, 300_000)
+    expect(rates.inputRate).toBeCloseTo(0.00000005)
+    expect(rates.outputRate).toBeCloseTo(0.0000001875)
+  })
+
+  test("keys an override omits inherit the base price", () => {
+    const rates = effectiveRates(
+      {
+        prompt: "0.00000005",
+        completion: "0.00000025",
+        input_cache_read: "0.000000005",
+        input_cache_write: "0.0000000625",
+        overrides: [{ min_prompt_tokens: 100_000, prompt: "0.0000001", completion: "0.0000002" }],
+      },
+      200_000,
+    )
+    expect(rates.inputRate).toBeCloseTo(0.0000001)
+    expect(rates.outputRate).toBeCloseTo(0.0000002)
+    expect(rates.readRate).toBeCloseTo(0.000000005)
+    expect(rates.writeRate).toBeCloseTo(0.0000000625)
+  })
+
+  test("later applicable entries win per key", () => {
+    const rates = effectiveRates(
+      {
+        prompt: "0.00000005",
+        completion: "0.00000025",
+        overrides: [
+          { min_prompt_tokens: 100_000, prompt: "0.0000001", completion: "0.0000005" },
+          { min_prompt_tokens: 200_000, prompt: "0.0000002" },
+        ],
+      },
+      300_000,
+    )
+    expect(rates.inputRate).toBeCloseTo(0.0000002)
+    expect(rates.outputRate).toBeCloseTo(0.0000005)
+  })
+
+  test("time-windowed entries never apply; the base price is the documented default", () => {
+    const rates = effectiveRates(
+      {
+        prompt: "0.00000005",
+        completion: "0.00000025",
+        overrides: [
+          { utc_start: 0, utc_end: 1600, prompt: "0.0000005", completion: "0.000001" },
+          { utc_start: 1600, utc_end: 0, prompt: "0.0000001", completion: "0.0000005" },
+        ],
+      },
+      300_000,
+    )
+    expect(rates.inputRate).toBeCloseTo(0.00000005)
+    expect(rates.outputRate).toBeCloseTo(0.00000025)
+  })
+
+  test("entries with unknown condition keys are skipped", () => {
+    const rates = effectiveRates(
+      {
+        prompt: "0.00000005",
+        completion: "0.00000025",
+        overrides: [{ min_prompt_tokens: 100_000, some_future_condition: true, prompt: "0.000001" } as never],
+      },
+      300_000,
+    )
+    expect(rates.inputRate).toBeCloseTo(0.00000005)
+  })
+
+  test("an override with a malformed threshold never applies", () => {
+    const rates = effectiveRates(
+      {
+        prompt: "0.00000005",
+        completion: "0.00000025",
+        overrides: [{ min_prompt_tokens: "N/A" as never, prompt: "0.000001", completion: "0.000002" }],
+      },
+      300_000,
+    )
+    expect(rates.inputRate).toBeCloseTo(0.00000005)
+    expect(rates.outputRate).toBeCloseTo(0.00000025)
+  })
+
+  test("an applicable override with unparseable prices is unknown pricing", () => {
+    const broken = {
+      prompt: "0.00000005",
+      completion: "0.00000025",
+      overrides: [{ min_prompt_tokens: 272_000, prompt: "N/A", completion: "0.000000375" }],
+    }
+    expect(hasKnownPricing(broken, 300_000)).toBe(false)
+    expect(hasKnownPricing(broken, 100_000)).toBe(true)
+    // Without a context size the check is conservative: every billable entry counts.
+    expect(hasKnownPricing(broken)).toBe(false)
+    const profile = { avgInput: 300_000, avgOutput: 0, cacheHitRate: 0, numRequests: 1 }
+    expect(() => requestCost(broken, profile)).toThrow()
+  })
+
+  test("an applicable override with an unparseable cache-write price is unknown pricing", () => {
+    const broken = {
+      prompt: "0.00000005",
+      completion: "0.00000025",
+      overrides: [{ min_prompt_tokens: 272_000, input_cache_write: "" }],
+    }
+    expect(hasKnownPricing(broken, 300_000)).toBe(false)
+    expect(hasKnownPricing(broken, 100_000)).toBe(true)
+  })
+
+  test("an override with an unparseable cache-read price falls back to the tier input rate", () => {
+    const rates = effectiveRates(
+      {
+        prompt: "0.00000005",
+        completion: "0.00000025",
+        overrides: [{ min_prompt_tokens: 272_000, prompt: "0.0000001", input_cache_read: "N/A" }],
+      },
+      300_000,
+    )
+    expect(rates.readRate).toBeCloseTo(rates.inputRate)
+    expect(rates.inputRate).toBeCloseTo(0.0000001)
+  })
+
+  test("requestCost bills the whole request at the tier the profile's context size picks", () => {
+    // h = 0: input side is (inputRate + writeRate) per token.
+    // Below the threshold: 200000 * (5e-8 + 6.25e-8) = 0.0225
+    // Above the threshold: 300000 * (1e-7 + 1.25e-7) = 0.0675
+    const below = { avgInput: 200_000, avgOutput: 0, cacheHitRate: 0, numRequests: 10 }
+    const above = { avgInput: 300_000, avgOutput: 0, cacheHitRate: 0, numRequests: 10 }
+    expect(requestCost(luna, below).perRequest).toBeCloseTo(0.0225)
+    expect(requestCost(luna, above).perRequest).toBeCloseTo(0.0675)
+    expect(totalCost(requestCost(luna, above).perRequest, 10)).toBeCloseTo(0.675)
+  })
+
+  test("free classification follows the tier the workload bills", () => {
+    // Free below the threshold, paid above it.
+    const freeBelow = {
+      prompt: "0",
+      completion: "0",
+      overrides: [{ min_prompt_tokens: 100_000, prompt: "0.0000001", completion: "0" }],
+    }
+    expect(isFreePricing(freeBelow)).toBe(true)
+    expect(isFreePricing(freeBelow, 50_000)).toBe(true)
+    expect(isFreePricing(freeBelow, 100_000)).toBe(true)
+    expect(isFreePricing(freeBelow, 200_000)).toBe(false)
+    // Paid at the base tier, free above it.
+    const freeAbove = {
+      prompt: "0.0000001",
+      completion: "0.0000002",
+      overrides: [{ min_prompt_tokens: 100_000, prompt: "0", completion: "0" }],
+    }
+    expect(isFreePricing(freeAbove)).toBe(false)
+    expect(isFreePricing(freeAbove, 200_000)).toBe(true)
+  })
+})

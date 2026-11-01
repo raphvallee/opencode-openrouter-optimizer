@@ -279,6 +279,24 @@ describe("free-priority mode", () => {
     expect(ranking.blacklist).toContain("junkfree")
   })
 
+  test("free detection keys on the workload's context size (tiered pricing)", () => {
+    // Free below 100K prompt tokens, paid above it: a long-context workload must not
+    // trigger free mode, a short-context one should.
+    const tieredFree = endpoint({
+      provider_name: "tiered",
+      tag: "tiered/fp8",
+      pricing: {
+        prompt: "0",
+        completion: "0",
+        overrides: [{ min_prompt_tokens: 100_000, prompt: "0.0000001", completion: "0" }],
+      },
+    })
+    expect(rankProviders([tieredFree, ...paidEndpoints], { ...profile, avgInput: 200_000 }, DEFAULT_OPTIONS).mode).toBe(
+      "cheapest",
+    )
+    expect(rankProviders([tieredFree, ...paidEndpoints], profile, DEFAULT_OPTIONS).mode).toBe("free")
+  })
+
   test("an unknown cache-read price does not stop a zero-priced provider from being free", () => {
     const freeReadUnknown = endpoint({
       provider_name: "freeread",

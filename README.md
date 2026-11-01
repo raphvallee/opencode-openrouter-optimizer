@@ -46,6 +46,20 @@ passes the filters, the plugin passes requests through (only `extraIgnore` is en
 rather than blocking every known route; `provider.sort` is only injected when at least one
 survivor exists.
 
+### Context-tiered pricing
+
+Some endpoints charge more above a prompt-token threshold (for example GPT-6 Luna's
+long-context tier). OpenRouter reports those tiers in `pricing.overrides`: an entry with
+`min_prompt_tokens` applies when a request's prompt tokens are strictly greater than the
+threshold, replacing the base prices for that whole request (keys the entry omits inherit
+the base price). The plugin picks the tier with the workload's `avgInput`: when the
+profile's average input is strictly above a tier's threshold, that tier's rates are used
+for the entire cost calculation. Time-windowed entries (`utc_start`/`utc_end`/`utc_days`)
+and entries with unknown condition fields are ignored: the top-level prices are the
+documented default, so they are billed at the base rate. Free-priority mode classifies
+providers at the tier the workload actually bills, so an endpoint free below a threshold
+does not trigger free mode for a long-context session.
+
 ### Free-priority mode
 
 Set `preferFreeProviders: false` to disable. When a canonical (non-`:free`) model still
@@ -54,7 +68,8 @@ is absent or zero; an unknown cache-read price falls back to the input price), t
 switches to `free` mode: every free provider stays routable (the top-3 cap does not apply)
 and the blacklist is exactly the paid providers. Free status is judged only on endpoints
 that pass the filters, so one broken free alias cannot leave the session without a usable
-route.
+route, and it is judged at the workload's context size, so a tier that prices long
+context above $0 keeps a long-context session out of free mode.
 
 ## Install
 
