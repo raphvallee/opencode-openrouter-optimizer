@@ -154,42 +154,6 @@ want only the TUI part (no server routing), reference the subpath directly, e.g.
 The `noTUI` option disables this part instead: set it to `true` and the TUI part
 registers nothing, so no toasts are raised while the server routing keeps running.
 
-## Inspect the state
-
-```sh
-bun run inspect
-```
-
-prints fetch/rank state (last fetch, survivors, blacklist size). OpenCode-side token
-usage now comes straight from OpenCode's own `stats --json` (no plugin-side copy).
-
-To preview exactly what the plugin's local stats side sees:
-
-```sh
-bun run scripts/stats-probe.ts
-```
-
-Optional live network check (no OpenCode needed):
-
-```sh
-bun run selfcheck [vendor/model]
-```
-
-## Storage
-
-The DB lives next to OpenCode's own storage (`~/.local/share/opencode`, honoring
-`XDG_DATA_HOME`) as `openrouter-optimizer.db`; every OpenCode instance and project
-feeds the same stats.
-
-## Development
-
-```sh
-bun install
-bun test       # unit tests: pricing formula, ranking, stats merge, db round-trip
-bun run typecheck
-bun run scripts/perf-probe.ts --live   # hot-path + snapshot size probe
-```
-
 ## Cost model
 
 ```
@@ -226,3 +190,39 @@ prompt rate). The ranking keeps the `topN` cheapest survivors; the `keepAtLeastN
 rescues the least-bad failures when nothing else stands, ordered by how badly each
 provider failed (magnitude-weighted: context and tool-call error rate weigh most, the
 completion cap least).
+
+## Inspect the state
+
+```sh
+bun run inspect
+```
+
+prints fetch/rank state (last fetch, survivors, blacklist size). OpenCode-side token
+usage now comes straight from OpenCode's own `stats --json` (no plugin-side copy).
+
+To preview exactly what the plugin's local stats side sees:
+
+```sh
+bun run scripts/stats-probe.ts
+```
+
+Optional live network check (no OpenCode needed):
+
+```sh
+bun run selfcheck [vendor/model]
+```
+
+## Storage
+
+The DB lives next to OpenCode's own storage (`~/.local/share/opencode`, honoring
+`XDG_DATA_HOME`) as `openrouter-optimizer.db`; every OpenCode instance and project
+feeds the same stats.
+
+## Development
+
+```sh
+bun install
+bun test       # unit tests: pricing formula, ranking, stats merge, db round-trip
+bun run typecheck
+bun run scripts/perf-probe.ts --live   # hot-path + snapshot size probe
+```
