@@ -41,7 +41,8 @@ export interface Filtered {
 }
 
 /**
- * Relative weight of every filter failure: how badly it breaks a session.
+ * Relative weight of every filter failure that reaches the rescue ordering: how
+ * badly it breaks a session.
  *
  * The numbers only have to order the rescue candidates, so they encode "how much
  * does a session suffer from this", not a cost model. Each failed check adds its
@@ -49,18 +50,18 @@ export interface Filtered {
  * provider that misses a threshold by a hair always beats one that misses it
  * badly.
  *
- * - status: the endpoint is not serving at all.
- * - tools: the model cannot call tools, so the session cannot work.
- * - pricing: the cost cannot be verified, so the route cannot be ranked.
  * - context: the session dies once the conversation outgrows the window.
  * - tool-errors: invalid tool calls break the agent loop.
  * - uptime: the provider drops requests outright.
  * - completion: answers get cut short, but the request still succeeds.
+ *
+ * The unrescuable failures (status, tools, pricing) carry no weight here on
+ * purpose: a provider that fails one of them is skipped as a rescue candidate
+ * before any ordering happens (see UNRESCUABLE_REASONS), so their magnitudes
+ * never compare. The `?? 20` default in filterSeverity keeps them ranked
+ * sensibly should that set ever change.
  */
 const FAILURE_WEIGHTS: Record<string, number> = {
-  status: 1000,
-  tools: 500,
-  pricing: 400,
   context: 40,
   "tool-errors": 30,
   uptime: 20,
@@ -228,9 +229,16 @@ interface Failure {
  * providers that fail least hard stand as well, and the ones that failed harder
  * stay blacklisted. The count of standing providers stops at keepAtLeastN, so
  * only the providers that missed the thresholds by the least are let through.
- * A provider whose best alias is dead, unpriceable or
- * tool-less is never rescued: the routing block ignores providers, not aliases,
- * so it would put the broken alias back on the route.
+ * When keepAtLeastN is higher than topN, the floor also raises the cap on the
+ * providers that passed, even when nothing needs rescuing.
+ *
+ * A rescued provider stands as a whole: the routing block ignores providers,
+ * not aliases, so every alias of a rescued provider goes back on the route.
+ * Two rules keep that honest. A provider with any dead, unpriceable or
+ * tool-less alias is never rescued: that broken alias could get the traffic,
+ * not just the alias the rescue decided on. And in free mode only an all-free
+ * provider is rescued: a provider that also carries a paid alias would put
+ * that paid alias back on the route.
  */
 export function rankProviders(
   endpoints: OpenRouterEndpoint[],
@@ -316,12 +324,15 @@ export function rankProviders(
   //    nobody vetted. The floor stops the filtering early: the providers that fail
   //    least hard stand as well, and the ones that failed harder stay blacklisted.
   //
-  //    Which ones: the providers the filters removed, ordered by how little they
-  //    failed - the lightest miss first (a provider at 89.9% uptime misses less
-  //    than one at 40%), then the fewest failed checks, then the cheapest, then
-  //    the slug so the order is stable. Providers that already stand are never
-  //    rescued, and in free mode only a free provider qualifies, so the mode's
-  //    promise survives.
+  //    Which ones: the providers the filters removed, ordered by the user's free
+  //    preference first (with preferFreeProviders, a rescued free provider
+  //    outranks a rescued paid one: the preference survives the floor, and every
+  //    rescue is named in a warning), then by how little they failed - the
+  //    lightest miss first (a provider at 89.9% uptime misses less than one at
+  //    40%), then the fewest failed checks, then the cheapest, then the slug so
+  //    the order is stable. Providers that already stand are never rescued, and
+  //    in free mode only an all-free provider qualifies, so the mode's promise
+  //    survives.
   const rescued: string[] = []
   const rescuedRanks: ProviderRank[] = []
   // The providers that stand on their own: the cheapest ones in cheapest mode
@@ -336,7 +347,7 @@ export function rankProviders(
   const deficit = Math.max(0, options.keepAtLeastN - standing.length)
   if (deficit > 0) {
     const extraIgnore = new Set(options.extraIgnore)
-    const candidates: Array<{ slug: string; failure: Failure }> = []
+    const candidates: Array<{ slug: string; failure: Failure; pool: Failure[]; free: boolean }> = []
     for (const [slug, failures] of failing) {
       // A provider that already stands on its own never needs rescuing.
       if (qualified.has(slug)) continue
@@ -348,15 +359,31 @@ export function rankProviders(
         ? failures.filter((failure) => isFreePricing(failure.endpoint.pricing, profile.avgInput))
         : failures
       if (pool.length === 0) continue
-      // The alias a rescue would put on the routing: the one that fails least hard.
+      // A rescued slug is routable as a whole, so every alias it has goes back
+      // on the route, not just the one the rescue is decided on. In free mode
+      // that means a provider that also carries a paid alias would put that
+      // paid alias back on the route: only an all-free provider may stand.
+      // (A provider with a passing alias is qualified and never reaches this
+      // point, so "every failing alias" covers the provider here.)
+      if (freeMode && pool.length !== failures.length) continue
+      // And for the same reason, a dead, unpriceable or tool-less alias anywhere
+      // on the provider can get the traffic: any one of them disqualifies the
+      // provider, not just the alias that failed least hard.
+      if (pool.some((failure) => failure.reasons.some((reason) => UNRESCUABLE_REASONS.has(reason)))) continue
+      // The alias the rescue decision is made on: the one that fails least hard.
       const best = pool.reduce((a, b) => (b.severity < a.severity ? b : a))
-      // A provider whose best alias is dead, unpriceable or tool-less is never
-      // rescued: the routing block ignores providers, not aliases, so it would
-      // put the broken alias back on the route.
-      if (best.reasons.some((reason) => UNRESCUABLE_REASONS.has(reason))) continue
-      candidates.push({ slug, failure: best })
+      // The user's free preference, as far as the rescue can honor it: a
+      // provider with a failing free alias is preferred over a paid one. In
+      // free mode every candidate is free, so this is a no-op there.
+      const free = pool.some((failure) => isFreePricing(failure.endpoint.pricing, profile.avgInput))
+      candidates.push({ slug, failure: best, pool, free })
     }
     candidates.sort((a, b) => {
+      // The user's free preference outranks the miss magnitude: without this,
+      // a barely-failing paid provider would be rescued ahead of a harder-
+      // failing free one, and the request would route to a paid provider
+      // against the preference. Every rescue is named in a warning.
+      if (options.preferFreeProviders && a.free !== b.free) return a.free ? -1 : 1
       if (a.failure.severity !== b.failure.severity) return a.failure.severity - b.failure.severity
       if (a.failure.reasons.length !== b.failure.reasons.length) {
         return a.failure.reasons.length - b.failure.reasons.length
@@ -367,13 +394,23 @@ export function rankProviders(
       if (cost !== 0) return cost
       return a.slug < b.slug ? -1 : 1
     })
-    for (const { slug, failure } of candidates.slice(0, deficit)) {
-      const { perRequest } = requestCost(failure.endpoint.pricing, profile)
-      const uptime = failure.endpoint.uptime_last_30m ?? failure.endpoint.uptime_last_1d ?? 100
+    for (const { slug, failure, pool } of candidates.slice(0, deficit)) {
+      // The rank entry describes the provider as the routing sees it: with
+      // sort: "price" OpenRouter tries the provider's cheapest alias first, so
+      // the entry reports that alias's price, not the least-bad failure's. The
+      // failed reasons stay on the alias the rescue decision used: they are why
+      // the provider was rescue-eligible.
+      const routed = pool.reduce((a, b) =>
+        requestCost(b.endpoint.pricing, profile).perRequest < requestCost(a.endpoint.pricing, profile).perRequest
+          ? b
+          : a,
+      )
+      const { perRequest } = requestCost(routed.endpoint.pricing, profile)
+      const uptime = routed.endpoint.uptime_last_30m ?? routed.endpoint.uptime_last_1d ?? 100
       rescued.push(slug)
       rescuedRanks.push({
         slug,
-        endpoint: failure.endpoint,
+        endpoint: routed.endpoint,
         slugUptime: uptime,
         perRequest,
         total: totalCost(perRequest, profile.numRequests),
@@ -390,7 +427,8 @@ export function rankProviders(
   const rankings = [...ordered, ...rescuedRanks]
   rankings.forEach((entry, index) => (entry.rank = index + 1))
   // The providers that stay routable: the ones that passed every filter (the
-  // cheapest of them, capped by topN) plus the rescued ones.
+  // cheapest of them, capped by the higher of topN and keepAtLeastN) plus the
+  // rescued ones.
   const survivors = [...standing.map((entry) => entry.slug), ...rescued]
   const survivorSet = new Set(survivors)
 

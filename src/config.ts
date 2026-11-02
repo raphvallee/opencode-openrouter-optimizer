@@ -3,7 +3,11 @@
 export interface OptimizerOptions {
   /** Re-fetch prices + re-rank when last_fetched is older than this many hours. */
   ttlHours: number
-  /** Number of cheapest providers allowed through. */
+  /**
+   * Number of cheapest providers allowed through. The `keepAtLeastN` floor
+   * raises this cap when it is higher: with `topN: 3` and `keepAtLeastN: 5`,
+   * up to 5 providers stay routable even when nothing needs rescuing.
+   */
   topN: number
   /**
    * Minimum number of providers that must stay routable after the endpoint

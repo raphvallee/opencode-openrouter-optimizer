@@ -58,14 +58,23 @@ prevents that: the filtering stops early and the providers that fail least hard 
 instead of giving up.
 
 Which ones stand is decided by how badly a provider failed, not by which check it failed.
-Every failed check adds its weight scaled by how far past the threshold it is (a dead
-endpoint and a model without tool support weigh the most, uptime and completion caps the
-least), so a provider at 89.9% uptime is a far better rescue candidate than one at 40%.
-The count of standing providers stops at `keepAtLeastN`: the providers that failed harder
-stay blacklisted. A provider whose best alias is dead, unpriceable or tool-less is never
-rescued (the routing block ignores providers, not aliases, so it would put the broken
-alias back on the route), and in free mode only a free provider can be rescued. The
-rescued providers are named in a warning, so a relaxed filter is never silent. Set
+Every failed check adds its weight scaled by how far past the threshold it is (the
+context window and the tool-call error rate weigh the most, the completion cap the
+least), so a provider at 89.9% uptime is a far better rescue candidate than one at 40%:
+the ordering is magnitude-weighted, not linear in the number of misses. The count of
+standing providers stops at `keepAtLeastN`: the providers that failed harder stay
+blacklisted. When `keepAtLeastN` is higher than `topN`, the floor also raises the cap on
+the providers that passed: `topN: 3` with `keepAtLeastN: 5` keeps up to 5 providers even
+when nothing needs rescuing.
+
+A rescued provider stands as a whole, not just the one alias the rescue decided on: the
+routing block ignores providers, not aliases, so every alias of a rescued provider goes
+back on the route. Two rules keep that honest. A provider with any dead, unpriceable or
+tool-less alias is never rescued: that broken alias could get the traffic. And in free
+mode only an all-free provider can be rescued: a provider that also carries a paid alias
+would put that paid alias back on the route. With `preferFreeProviders` on, the rescue
+still honors the free preference: free providers are kept before paid ones. The rescued
+providers are named in a warning, so a relaxed filter is never silent. Set
 `keepAtLeastN: 0` to turn the fallback off: a starved model then passes its requests
 through unrouted, as before.
 
@@ -185,7 +194,7 @@ registers nothing, so no toasts are raised while the server routing keeps runnin
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `ttlHours` | `6` | Prices/refresh staleness window |
-| `topN` | `3` | Cheapest providers allowed through |
+| `topN` | `3` | Cheapest providers allowed through (the `keepAtLeastN` floor raises this cap when it is higher) |
 | `keepAtLeastN` | `1` | Floor on the providers that stay routable: when the filters starve the routing, the providers that fail least hard are kept instead of letting the request go out unrouted; `0` disables the fallback |
 | `minContextLength` | `64000` | Endpoint context filter |
 | `minMaxCompletionTokens` | `8000` | Endpoint output-cap filter (3072-token style providers are excluded) |
@@ -196,7 +205,7 @@ registers nothing, so no toasts are raised while the server routing keeps runnin
 | `noTUI` | `false` | Disable the TUI part (no routing-failure toasts); server routing is unaffected |
 | `rankingWaitMs` | `15000` | Max time a first request waits for its initial ranking; `0` disables waiting (pass through immediately) |
 | `fallbackAvgInput` / `fallbackAvgOutput` / `fallbackCacheHitRate` | `20000` / `800` / `0.2` | Fallback profile until stats exist |
-| `preferFreeProviders` | `true` | $0 providers ("free mode") always stay routable; paid providers get blacklisted |
+| `preferFreeProviders` | `true` | $0 providers ("free mode") always stay routable; paid providers get blacklisted; the rescue floor also prefers free providers when none pass the filters |
 | `extraIgnore` | `[]` | Provider slugs always blacklisted |
 | `managementKeyEnv` | `OPENROUTER_MANAGEMENT_KEY` | Env var name for the Activity key |
 | `statsCommand` | `opencode` | CLI used for `stats --json` (background only) |

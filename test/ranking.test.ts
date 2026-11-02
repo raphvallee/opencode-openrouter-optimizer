@@ -330,9 +330,9 @@ describe("keepAtLeastN floor", () => {
     expect(ranking.blacklist).toEqual(["dead", "unpriced", "notools"])
   })
 
-  test("the best alias of a provider decides whether it can be rescued", () => {
-    // One alias is dead, the other one only misses the uptime threshold: the best
-    // alias decides, and the provider can stand.
+  test("a provider with a dead alias is never rescued even when another alias only misses a threshold", () => {
+    // Routing is provider-wide: a rescued "mixed" would put its dead alias back
+    // on the route alongside the flaky one, so the provider is skipped.
     const ranking = rankProviders(
       [
         endpoint({ provider_name: "mixed", tag: "mixed/dead", status: 500 }),
@@ -341,8 +341,26 @@ describe("keepAtLeastN floor", () => {
       profile,
       DEFAULT_OPTIONS,
     )
-    expect(ranking.rescued).toEqual(["mixed"])
-    expect(ranking.survivors).toEqual(["mixed"])
+    expect(ranking.rescued).toEqual([])
+    expect(ranking.survivors).toEqual([])
+    expect(ranking.blacklist).toEqual([])
+  })
+
+  test("a tool-less or unpriced alias also blocks a rescue", () => {
+    for (const overrides of [
+      { supported_parameters: ["response_format"] },
+      { pricing: { prompt: "", completion: "" } },
+    ] as Partial<OpenRouterEndpoint>[]) {
+      const ranking = rankProviders(
+        [
+          endpoint({ provider_name: "mixed", tag: "mixed/broken", ...overrides }),
+          endpoint({ provider_name: "mixed", tag: "mixed/flaky", uptime_last_30m: 89.9 }),
+        ],
+        profile,
+        DEFAULT_OPTIONS,
+      )
+      expect(ranking.rescued).toEqual([])
+    }
   })
 
   test("a provider whose every alias is dead is never rescued", () => {
@@ -397,6 +415,105 @@ describe("keepAtLeastN floor", () => {
     expect(ranking.survivors).toEqual(["freegood", "freeflaky"])
     expect(ranking.rescued).toEqual(["freeflaky"])
     expect(ranking.blacklist).toEqual(["paidflaky"])
+  })
+
+  test("in free mode a provider that also carries a paid alias is never rescued", () => {
+    // A rescued slug is routable as a whole: its paid aliases would go back on
+    // the route and break free mode. Only an all-free provider can stand.
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "freegood", tag: "freegood/fp8", pricing: { prompt: "0", completion: "0" } }),
+        endpoint({
+          provider_name: "mixedfree",
+          tag: "mixedfree/free",
+          pricing: { prompt: "0", completion: "0" },
+          uptime_last_30m: 89.9,
+        }),
+        endpoint({
+          provider_name: "mixedfree",
+          tag: "mixedfree/paid",
+          pricing: { prompt: "0.0000001", completion: "0.0000002" },
+          uptime_last_30m: 89.8,
+        }),
+      ],
+      profile,
+      { ...DEFAULT_OPTIONS, keepAtLeastN: 2 },
+    )
+    expect(ranking.mode).toBe("free")
+    expect(ranking.survivors).toEqual(["freegood"])
+    expect(ranking.rescued).toEqual([])
+    expect(ranking.blacklist).toEqual(["mixedfree"])
+  })
+
+  test("preferFreeProviders rescues free providers before paid ones", () => {
+    // No free provider passes the filters, so the mode is cheapest - but the
+    // user's free preference still orders the rescue: the free provider stands
+    // even though the paid one failed the filters less hard.
+    const ranking = rankProviders(
+      [
+        endpoint({
+          provider_name: "freefar",
+          tag: "freefar/fp8",
+          pricing: { prompt: "0", completion: "0" },
+          uptime_last_30m: 10,
+        }),
+        endpoint({ provider_name: "paidnear", tag: "paidnear/fp8", uptime_last_30m: 89.9 }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    expect(ranking.mode).toBe("cheapest")
+    expect(ranking.rescued).toEqual(["freefar"])
+    expect(ranking.survivors).toEqual(["freefar"])
+    expect(ranking.blacklist).toEqual(["paidnear"])
+  })
+
+  test("preferFreeProviders=false keeps the severity ordering in the rescue", () => {
+    const options = resolveOptions({ preferFreeProviders: false })
+    const ranking = rankProviders(
+      [
+        endpoint({
+          provider_name: "freefar",
+          tag: "freefar/fp8",
+          pricing: { prompt: "0", completion: "0" },
+          uptime_last_30m: 10,
+        }),
+        endpoint({ provider_name: "paidnear", tag: "paidnear/fp8", uptime_last_30m: 89.9 }),
+      ],
+      profile,
+      options,
+    )
+    expect(ranking.rescued).toEqual(["paidnear"])
+    expect(ranking.survivors).toEqual(["paidnear"])
+    expect(ranking.blacklist).toEqual(["freefar"])
+  })
+
+  test("a rescued provider's rank entry reports the cheapest failing alias, as routing would bill it", () => {
+    // Two failing aliases: the least-bad one (uptime 89.9) wins the rescue
+    // decision, but sort: "price" makes OpenRouter try the cheapest one first.
+    const ranking = rankProviders(
+      [
+        endpoint({
+          provider_name: "two",
+          tag: "two/slow",
+          pricing: { prompt: "0.0000002", completion: "0.0000004" },
+          uptime_last_30m: 89.9,
+        }),
+        endpoint({
+          provider_name: "two",
+          tag: "two/cheap",
+          pricing: { prompt: "0.0000001", completion: "0.0000001" },
+          uptime_last_30m: 89.8,
+        }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    const entry = ranking.rankings.find((rank) => rank.slug === "two")
+    expect(entry?.rescued).toBe(true)
+    // The routed alias is the cheap one; the rescue reason is the light miss.
+    expect(entry?.perRequest).toBeCloseTo(10_000 * 0.0000001 + 1_000 * 0.0000001)
+    expect(entry?.failedReasons).toEqual(["uptime"])
   })
 
   test("the rescued provider is marked with the checks it failed", () => {
