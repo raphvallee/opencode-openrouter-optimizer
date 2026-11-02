@@ -1,126 +1,24 @@
 # opencode-openrouter-optimizer
 
-OpenCode v2 plugin (Bun + TypeScript) that keeps OpenRouter routing cheap:
+An OpenCode v2 plugin (Bun + TypeScript) that keeps OpenRouter routing cheap. It ranks
+OpenRouter providers by expected cost and injects a per-request provider blacklist into
+every request, so you always land on one of the cheapest providers that actually works.
 
-- Tracks every OpenRouter model used by OpenCode.
-- Per model, fetches prices-per-provider (`GET /api/v1/models/{slug}/endpoints`), computes
-  a compact routing snapshot (survivors, blacklist, mode) and stores it in sqlite with
-  `last_fetched` plus retry/backoff state. The snapshot is cached in memory, so the request
-  path does no database reads for known models.
-- Computes the expected cost per request from OpenRouter Activity aggregates plus
-  OpenCode's own usage stats (`opencode stats --json --models --days 30`, run only in
-  the background refresh task with a cached single-flight snapshot), ranks providers,
-  keeps the 3 cheapest and blacklists the rest by injecting `provider.ignore`
-  (plus `provider.sort: "price"`) into every request. When the endpoint filters would
-  leave too few providers standing, the `keepAtLeastN` floor keeps the providers that
-  fail least hard instead of routing nothing.
-- A model seen for the first time waits for its ranking before the request is sent, so the
-  first prompt already goes to the provider the session will keep using. Switching after
-  the fact would pay a cache-write charge twice on providers that bill for cache writes.
-  Later requests use the in-memory snapshot; the 6h TTL refresh runs in the background and
-  applies to the next request. A refresh that fails or exceeds `rankingWaitMs` releases the
-  request unmodified instead of hanging it. Pass-through requests are inspected from a clone
-  and are never re-serialized; only requests that receive a routing block are rebuilt.
+## What it does
 
-## Cost model
+- Tracks every OpenRouter model your sessions use.
+- Per model, fetches per-provider prices and endpoint health from OpenRouter, ranks the
+  providers, and caches the result in memory (with a sqlite-backed snapshot for restarts).
+- Keeps the cheapest providers routable and blacklists the rest by injecting
+  `provider.ignore` (plus `provider.sort: "price"`) into each request.
+- Merges real usage data from OpenRouter Activity (when you provide a management key)
+  and OpenCode's own stats, so ranking reflects how *you* actually use each model.
+- Fails open: a request it cannot route goes out unmodified, with a `Routing failure`
+  message in the transcript and an error toast in the TUI, so you always know why.
 
-```
-Rate     = BaseRate * (1 - d)          d = pricing.discount from the endpoints API
-readRate = parsed input_cache_read ?? prompt   (unparseable means "no cache")
-writeRate= parsed input_cache_write ?? 0       (absent is 0; unparseable is unknown pricing)
-perRequest = T_in * (h*readRate + (1-h)*(inputRate + writeRate)) + T_out * outputRate
-total      = perRequest * numRequests
-```
+## Quick start
 
-`T_in`, `T_out`, `h`, `numRequests` are merged from OpenCode usage (all providers,
-because OpenCode request shapes do not depend on the provider) and OpenRouter Activity
-rows (all clients using the OpenRouter account), treated as equals. Providers claim the
-best surviving endpoint among the aliases they expose. Endpoints without tool support,
-under 64k context, under 8k max completion tokens, under 90% uptime, or with missing or
-unparseable prices are excluded from ranking and blacklisted alongside the non-surviving
-providers, so the injected `provider.sort: "price"` cannot steer traffic to a
-cheap-but-broken endpoint. An endpoint whose required prices cannot be parsed (`""`,
-`"N/A"`, ...) is treated as unknown pricing, never as free or $0. The same applies to a
-present but unparseable cache-write price: the endpoint is blacklisted rather than billing
-the cache write as $0. An unparseable cache-read price is treated as "no cache": cached
-input is billed at the prompt rate instead of receiving a cache discount. When no endpoint
-passes the filters, the `keepAtLeastN` floor takes over (see below); only when even that
-leaves nothing standing does the plugin pass requests through (only `extraIgnore` is
-enforced) rather than blocking every known route. `provider.sort` is only injected when at
-least one survivor exists.
-
-### The keepAtLeastN floor
-
-The endpoint filters can be strict enough to leave no provider standing: a model whose
-providers all have a 24k context, or all run below 90% uptime. The request would then go
-out unrouted, to a provider nobody vetted. `keepAtLeastN` (default `1`) is the floor that
-prevents that: the filtering stops early and the providers that fail least hard stand
-instead of giving up.
-
-Which ones stand is decided by how badly a provider failed, not by which check it failed.
-Every failed check adds its weight scaled by how far past the threshold it is (the
-context window and the tool-call error rate weigh the most, the completion cap the
-least), so a provider at 89.9% uptime is a far better rescue candidate than one at 40%:
-the ordering is magnitude-weighted, not linear in the number of misses. The count of
-standing providers stops at `keepAtLeastN`: the providers that failed harder stay
-blacklisted. When `keepAtLeastN` is higher than `topN`, the floor also raises the cap on
-the providers that passed: `topN: 3` with `keepAtLeastN: 5` keeps up to 5 providers even
-when nothing needs rescuing.
-
-A rescued provider stands as a whole, not just the one alias the rescue decided on: the
-routing block ignores providers, not aliases, so every alias of a rescued provider goes
-back on the route. Two rules keep that honest. A provider with any dead, unpriceable or
-tool-less alias is never rescued: that broken alias could get the traffic. And in free
-mode only an all-free provider can be rescued: a provider that also carries a paid alias
-would put that paid alias back on the route. With `preferFreeProviders` on, the rescue
-still honors the free preference: free providers are kept before paid ones. The rescued
-providers are named in a warning, so a relaxed filter is never silent. Set
-`keepAtLeastN: 0` to turn the fallback off: a starved model then passes its requests
-through unrouted, as before.
-
-### Context-tiered pricing
-
-Why this exists: most recent OpenAI models (GPT-6 Luna, GPT-6.1 Terra/Sol, and similar
-releases) no longer have a single flat price. They charge one rate for normal requests
-and a higher rate once the prompt crosses a context threshold, so a cost estimate built
-from only the base rates would look much cheaper than what a long-context session
-actually pays. The plugin applies whichever tier matches the session's context size.
-
-Some endpoints charge more above a prompt-token threshold (for example GPT-6 Luna's
-long-context tier). OpenRouter reports those tiers in `pricing.overrides`: an entry with
-`min_prompt_tokens` applies when a request's prompt tokens are strictly greater than the
-threshold, replacing the base prices for that whole request (keys the entry omits inherit
-the base price). The plugin picks the tier with the workload's `avgInput`: when the
-profile's average input is strictly above a tier's threshold, that tier's rates are used
-for the entire cost calculation. Time-windowed entries (`utc_start`/`utc_end`/`utc_days`)
-and entries with unknown condition fields are ignored: the top-level prices are the
-documented default, so they are billed at the base rate. Free-priority mode classifies
-providers at the tier the workload actually bills, so an endpoint free below a threshold
-does not trigger free mode for a long-context session.
-
-### Free-priority mode
-
-Set `preferFreeProviders: false` to disable. When a canonical (non-`:free`) model still
-has providers serving it at $0 (input and output parse to zero and any cache-write price
-is absent or zero; an unknown cache-read price falls back to the input price), the ranker
-switches to `free` mode: every free provider stays routable (the top-3 cap does not apply)
-and the blacklist is exactly the paid providers. Free status is judged only on endpoints
-that pass the filters, so one broken free alias cannot leave the session without a usable
-route, and it is judged at the workload's context size, so a tier that prices long
-context above $0 keeps a long-context session out of free mode.
-
-## Install
-
-Add the published package to `opencode.jsonc`:
-
-```jsonc title="opencode.jsonc"
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": ["opencode-openrouter-optimizer"],
-}
-```
-
-Pass options in object form:
+1. Add the plugin to `opencode.jsonc`:
 
 ```jsonc title="opencode.jsonc"
 {
@@ -128,15 +26,26 @@ Pass options in object form:
   "plugins": [
     {
       "package": "opencode-openrouter-optimizer",
-      "options": {
-        "ttlHours": 6,
-        "topN": 3,
-        "debug": true,
-      },
+      "options": { "debug": true }
     },
   ],
 }
 ```
+
+2. Restart OpenCode. That's it. The defaults work out of the box: the plugin ranks
+   providers by cost, keeps the 3 cheapest that pass its quality filters, and blocks
+   the rest.
+
+3. Optional, but recommended: export an OpenRouter **management** key (Settings >
+   Management Keys on openrouter.ai - not an inference key) so ranking can use 30 days
+   of your real account activity:
+
+```sh
+export OPENROUTER_MANAGEMENT_KEY=sk-mgmt-...
+```
+
+Without it, ranking uses OpenCode-side usage and a fallback profile until real data
+accumulates.
 
 A local clone can be loaded the same way, by path:
 
@@ -146,50 +55,55 @@ A local clone can be loaded the same way, by path:
   "plugins": [
     {
       "package": "D:/t3-projects/opencode-openrouter-optimizer",
-      "options": { "debug": true },
+      "options": { "debug": true }
     },
   ],
 }
 ```
 
-Optional: export `OPENROUTER_MANAGEMENT_KEY` (a management key from
-openrouter.ai Settings > Management Keys, not an inference key) to enrich the profile
-with 30 days of OpenRouter account activity. Without it, ranking uses OpenCode-side
-usage and the fallback profile until real data accumulates.
+## How routing works
 
-## Seeing routing failures
+For every OpenRouter model, the plugin filters endpoints by quality (context window,
+completion cap, uptime, tool-call support and error rate), ranks the survivors by
+expected cost, and lets only the cheapest few through. Three behaviors matter to know:
 
-A request the plugin cannot route is sent unfiltered, which can cost real money. The
-plugin refuses to let that happen silently: it writes a `Routing failure` message into
-the session transcript naming the model and the reason (no ranking available, no
-endpoint passed the filters and none could be kept by the `keepAtLeastN` floor, non-JSON
-body, routing error), once per session/model/reason.
+- **Cheapest-first routing**: the `topN` cheapest survivors (default 3) stay routable
+  and `provider.sort: "price"` tells OpenRouter to prefer the cheapest of those.
+- **Free mode**: when any surviving provider serves the model at $0, every free provider
+  stays routable (the top-3 cap does not apply to them) and all paid providers are
+  blacklisted. Free status is judged at your workload's context length, so a tier that
+  prices long contexts does not sneak in.
+- **The rescue floor**: if the quality filters would starve the routing (e.g. only 1
+  endpoint exists, or all fail context/uptime checks), the `keepAtLeastN` floor keeps
+  the least-bad providers instead of sending the request unrouted. `0` disables the
+  floor; the default `1` guarantees at least one provider stands.
 
-The package also ships a TUI part at the `./tui` export that raises an error toast for
-each of those messages, so the failure is visible even when you are not reading the
-transcript. It needs no extra configuration: one `plugins` entry loads every part of
-the package - OpenCode's TUI host resolves the `./tui` subpath export of the loaded
-plugin automatically and runs it in the TUI process, where `@opentui/*` is already
-provided as peer dependencies. There is no `tui` key in `opencode.jsonc`; if you ever
-want only the TUI part (no server routing), reference the subpath directly, e.g.
-`"plugins": ["opencode-openrouter-optimizer/tui"]` in the TUI's `cli.json`.
+The first request for a new model waits (up to `rankingWaitMs`, default 15s) for its
+ranking, so the session starts on the provider it will keep using and does not pay a
+cache-write charge twice. Refreshes run in the background and apply to the next request.
 
-The `noTUI` option disables this part instead: set it to `true` and the TUI part
-registers nothing, so no toasts are raised while the server routing keeps running.
+## Configuration
+
+You normally never need to set any option - defaults are sane. Common tweaks:
 
 ```jsonc title="opencode.jsonc"
 {
-  "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
       "package": "opencode-openrouter-optimizer",
-      "options": { "noTUI": true },
+      "options": {
+        "topN": 3,              // how many cheapest providers stay routable
+        "keepAtLeastN": 1,      // rescue floor; 0 disables
+        "debug": true,          // verbose logging while you tune
+        "noTUI": false,         // false = show error toasts for routing failures
+        "extraIgnore": []       // provider slugs to always blacklist, e.g. "chutes"
+      },
     },
   ],
 }
 ```
 
-## Options
+### Full reference
 
 | Option                                                            | Default                     | Meaning                                                                                                                                                                                               |
 | ----------------------------------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -215,48 +129,9 @@ registers nothing, so no toasts are raised while the server routing keeps runnin
 | `debug`                                                           | `false`                     | Verbose logging                                                                                                                                                                                       |
 | `debugBlacklistReasons`                                           | `false`                     | With `debug`, also log why every blacklisted provider was blocked                                                                                                                                     |
 
-Every option with its default value, ready to copy into `opencode.jsonc` and tweak
-granularly (you normally never need to set any of these):
-
-```jsonc title="opencode.jsonc"
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "opencode-openrouter-optimizer",
-      "options": {
-        "ttlHours": 6,
-        "topN": 3,
-        "keepAtLeastN": 1,
-        "minContextLength": 64000,
-        "minMaxCompletionTokens": 8000,
-        "minUptimePercent": 90,
-        "requireToolSupport": true,
-        "maxToolCallErrorRate": 1,
-        "injectSort": true,
-        "rankingWaitMs": 15000,
-        "fallbackAvgInput": 20000,
-        "fallbackAvgOutput": 800,
-        "fallbackCacheHitRate": 0.2,
-        "preferFreeProviders": true,
-        "noTUI": false,
-        "extraIgnore": [],
-        "managementKeyEnv": "OPENROUTER_MANAGEMENT_KEY",
-        "statsCommand": "opencode",
-        "statsDays": 30,
-        "statsCacheMinutes": 10,
-        "debug": false,
-        "debugBlacklistReasons": false,
-      },
-    },
-  ],
-}
-```
-
-Two options are deliberately omitted from that block because they are test hooks, not
-things you would set in `opencode.jsonc`: `statsRun` (a function injected in code to
-replace the stats CLI runner) and `dbPath` (a string override for the sqlite file path,
-used by tests).
+Two options are test hooks, not things you would set in `opencode.jsonc`: `statsRun`
+(a function injected in code to replace the stats CLI runner) and `dbPath` (a sqlite
+path override, used by tests).
 
 Configuration is strict. Unknown option names and invalid values abort plugin startup
 with a message naming the option and the expected type or range. Check the exact spelling
@@ -264,9 +139,25 @@ in the table above; for example `topn` is rejected with a suggestion to use `top
 `injectSort: 0` is rejected because booleans must be `true` or `false`. This is deliberate:
 silently falling back to a default would change routing without telling you.
 
-The DB lives next to OpenCode's own storage (`~/.local/share/opencode`, honoring
-`XDG_DATA_HOME`) as `openrouter-optimizer.db`; every OpenCode instance and project
-feeds the same stats.
+## Seeing routing failures
+
+A request the plugin cannot route is sent unfiltered, which can cost real money. The
+plugin refuses to let that happen silently: it writes a `Routing failure` message into
+the session transcript naming the model and the reason (no ranking available, no
+endpoint passed the filters and none could be kept by the `keepAtLeastN` floor, non-JSON
+body, routing error), once per session/model/reason.
+
+The package also ships a TUI part at the `./tui` export that raises an error toast for
+each of those messages, so the failure is visible even when you are not reading the
+transcript. It needs no extra configuration: one `plugins` entry loads every part of
+the package - OpenCode's TUI host resolves the `./tui` subpath export of the loaded
+plugin automatically and runs it in the TUI process, where `@opentui/*` is already
+provided as peer dependencies. There is no `tui` key in `opencode.jsonc`; if you ever
+want only the TUI part (no server routing), reference the subpath directly, e.g.
+`"plugins": ["opencode-openrouter-optimizer/tui"]` in the TUI's `cli.json`.
+
+The `noTUI` option disables this part instead: set it to `true` and the TUI part
+registers nothing, so no toasts are raised while the server routing keeps running.
 
 ## Inspect the state
 
@@ -289,19 +180,11 @@ Optional live network check (no OpenCode needed):
 bun run selfcheck [vendor/model]
 ```
 
-## Failure visibility
+## Storage
 
-When a request cannot be routed - no ranking available, no endpoint passed the
-filters, or the request body is unreadable - the request goes out unmodified (fail
-open) and the plugin says so instead of failing silently:
-
-- A synthetic message is written to the session naming the model and the reason.
-- A transient error toast appears in the OpenCode TUI (the package's `./tui` part
-  listens for those synthetic messages). Non-OpenRouter providers are never touched,
-  so no toast fires for traffic this plugin is not allowed to route.
-
-The TUI part is optional: OpenCode loads it automatically when it loads the plugin,
-and its absence degrades to transcript-only visibility.
+The DB lives next to OpenCode's own storage (`~/.local/share/opencode`, honoring
+`XDG_DATA_HOME`) as `openrouter-optimizer.db`; every OpenCode instance and project
+feeds the same stats.
 
 ## Development
 
@@ -311,3 +194,40 @@ bun test       # unit tests: pricing formula, ranking, stats merge, db round-tri
 bun run typecheck
 bun run scripts/perf-probe.ts --live   # hot-path + snapshot size probe
 ```
+
+## Cost model
+
+```
+Rate      = BaseRate * (1 - d)              d = pricing.discount from the endpoints API
+readRate  = parsed input_cache_read ?? prompt   (unparseable means "no cache")
+writeRate = parsed input_cache_write ?? 0       (absent is 0; unparseable is unknown pricing)
+perRequest  = T_in * (h*readRate + (1-h)*(inputRate + writeRate)) + T_out * outputRate
+total       = perRequest * numRequests
+```
+
+`T_in`, `T_out`, `h`, `numRequests` are merged from OpenCode usage (all providers,
+because OpenCode request shapes do not depend on the provider) and OpenRouter Activity
+rows (all clients using the OpenRouter account), treated as equals.
+
+**Context-tiered pricing**: some endpoints charge more above a prompt-token threshold
+(recent OpenAI models, for example). OpenRouter reports those tiers in
+`pricing.overrides`; the plugin picks the tier matching the workload's average input
+size, so a long-context session is billed at the long-context rate, not the base rate.
+
+**The rescue floor in detail**: a rescued provider stands as a whole (every alias of it
+goes back on the route), so a provider with any dead, unpriceable or tool-less alias is
+never rescued - that broken alias could get the traffic. In free mode only an all-free
+provider can be rescued. Rescued providers are named in a warning, so a relaxed filter
+is never silent.
+
+How the blacklist is built from that cost, in one paragraph: each OpenRouter model has
+a single price point; its providers are ranked by the expected cost above (a cheap
+provider with a 3072-token output cap is excluded for workloads that write more than
+that). Endpoints that fail quality filters (context, completion cap, uptime, tool-call
+error rate) are excluded regardless of price - with one caveat: an endpoint with an
+unparseable cache-write price is blacklisted rather than billing the cache write as $0,
+and an unparseable cache-read price is treated as "no cache" (cached input billed at the
+prompt rate). The ranking keeps the `topN` cheapest survivors; the `keepAtLeastN` floor
+rescues the least-bad failures when nothing else stands, ordered by how badly each
+provider failed (magnitude-weighted: context and tool-call error rate weigh most, the
+completion cap least).
