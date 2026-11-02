@@ -1,6 +1,6 @@
-export { definePlugin as plugin } from "./src/plugin"
-export { resolveOptions } from "./src/config"
+export { definePlugin as plugin } from "./src/plugin";
+export { resolveOptions } from "./src/config";
 
-import { definePlugin } from "./src/plugin"
+import { definePlugin } from "./src/plugin";
 
-export default definePlugin()
+export default definePlugin();

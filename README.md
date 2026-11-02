@@ -116,7 +116,7 @@ Add the published package to `opencode.jsonc`:
 ```jsonc title="opencode.jsonc"
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["opencode-openrouter-optimizer"]
+  "plugins": ["opencode-openrouter-optimizer"],
 }
 ```
 
@@ -131,10 +131,10 @@ Pass options in object form:
       "options": {
         "ttlHours": 6,
         "topN": 3,
-        "debug": true
-      }
-    }
-  ]
+        "debug": true,
+      },
+    },
+  ],
 }
 ```
 
@@ -146,9 +146,9 @@ A local clone can be loaded the same way, by path:
   "plugins": [
     {
       "package": "D:/t3-projects/opencode-openrouter-optimizer",
-      "options": { "debug": true }
-    }
-  ]
+      "options": { "debug": true },
+    },
+  ],
 }
 ```
 
@@ -183,37 +183,37 @@ registers nothing, so no toasts are raised while the server routing keeps runnin
   "plugins": [
     {
       "package": "opencode-openrouter-optimizer",
-      "options": { "noTUI": true }
-    }
-  ]
+      "options": { "noTUI": true },
+    },
+  ],
 }
 ```
 
 ## Options
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `ttlHours` | `6` | Prices/refresh staleness window |
-| `topN` | `3` | Cheapest providers allowed through (the `keepAtLeastN` floor raises this cap when it is higher) |
-| `keepAtLeastN` | `1` | Floor on the providers that stay routable: when the filters starve the routing, the providers that fail least hard are kept instead of letting the request go out unrouted; `0` disables the fallback |
-| `minContextLength` | `64000` | Endpoint context filter |
-| `minMaxCompletionTokens` | `8000` | Endpoint output-cap filter (3072-token style providers are excluded) |
-| `minUptimePercent` | `90` | Endpoint uptime filter |
-| `maxToolCallErrorRate` | `1` | Provider Tool Call Error Rate cap in percent; providers above it are filtered out and blacklisted. `100` disables |
-| `requireToolSupport` | `true` | Require `tools`+`tool_choice` params |
-| `injectSort` | `true` | Add `provider.sort: "price"` |
-| `noTUI` | `false` | Disable the TUI part (no routing-failure toasts); server routing is unaffected |
-| `rankingWaitMs` | `15000` | Max time a first request waits for its initial ranking; `0` disables waiting (pass through immediately) |
-| `fallbackAvgInput` / `fallbackAvgOutput` / `fallbackCacheHitRate` | `20000` / `800` / `0.2` | Fallback profile until stats exist |
-| `preferFreeProviders` | `true` | $0 providers ("free mode") always stay routable; paid providers get blacklisted; the rescue floor also prefers free providers when none pass the filters |
-| `extraIgnore` | `[]` | Provider slugs always blacklisted |
-| `managementKeyEnv` | `OPENROUTER_MANAGEMENT_KEY` | Env var name for the Activity key |
-| `statsCommand` | `opencode` | CLI used for `stats --json` (background only) |
-| `statsDays` | `30` | Stats window, aligned with the Activity 30-day aggregate |
-| `statsCacheMinutes` | `10` | Stats snapshot cache; concurrent refreshes share one snapshot |
-| `dbPath` | global OpenCode data dir | sqlite file override (tests) |
-| `debug` | `false` | Verbose logging |
-| `debugBlacklistReasons` | `false` | With `debug`, also log why every blacklisted provider was blocked |
+| Option                                                            | Default                     | Meaning                                                                                                                                                                                               |
+| ----------------------------------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ttlHours`                                                        | `6`                         | Prices/refresh staleness window                                                                                                                                                                       |
+| `topN`                                                            | `3`                         | Cheapest providers allowed through (the `keepAtLeastN` floor raises this cap when it is higher)                                                                                                       |
+| `keepAtLeastN`                                                    | `1`                         | Floor on the providers that stay routable: when the filters starve the routing, the providers that fail least hard are kept instead of letting the request go out unrouted; `0` disables the fallback |
+| `minContextLength`                                                | `64000`                     | Endpoint context filter                                                                                                                                                                               |
+| `minMaxCompletionTokens`                                          | `8000`                      | Endpoint output-cap filter (3072-token style providers are excluded)                                                                                                                                  |
+| `minUptimePercent`                                                | `90`                        | Endpoint uptime filter                                                                                                                                                                                |
+| `maxToolCallErrorRate`                                            | `1`                         | Provider Tool Call Error Rate cap in percent; providers above it are filtered out and blacklisted. `100` disables                                                                                     |
+| `requireToolSupport`                                              | `true`                      | Require `tools`+`tool_choice` params                                                                                                                                                                  |
+| `injectSort`                                                      | `true`                      | Add `provider.sort: "price"`                                                                                                                                                                          |
+| `noTUI`                                                           | `false`                     | Disable the TUI part (no routing-failure toasts); server routing is unaffected                                                                                                                        |
+| `rankingWaitMs`                                                   | `15000`                     | Max time a first request waits for its initial ranking; `0` disables waiting (pass through immediately)                                                                                               |
+| `fallbackAvgInput` / `fallbackAvgOutput` / `fallbackCacheHitRate` | `20000` / `800` / `0.2`     | Fallback profile until stats exist                                                                                                                                                                    |
+| `preferFreeProviders`                                             | `true`                      | $0 providers ("free mode") always stay routable; paid providers get blacklisted; the rescue floor also prefers free providers when none pass the filters                                              |
+| `extraIgnore`                                                     | `[]`                        | Provider slugs always blacklisted                                                                                                                                                                     |
+| `managementKeyEnv`                                                | `OPENROUTER_MANAGEMENT_KEY` | Env var name for the Activity key                                                                                                                                                                     |
+| `statsCommand`                                                    | `opencode`                  | CLI used for `stats --json` (background only)                                                                                                                                                         |
+| `statsDays`                                                       | `30`                        | Stats window, aligned with the Activity 30-day aggregate                                                                                                                                              |
+| `statsCacheMinutes`                                               | `10`                        | Stats snapshot cache; concurrent refreshes share one snapshot                                                                                                                                         |
+| `dbPath`                                                          | global OpenCode data dir    | sqlite file override (tests)                                                                                                                                                                          |
+| `debug`                                                           | `false`                     | Verbose logging                                                                                                                                                                                       |
+| `debugBlacklistReasons`                                           | `false`                     | With `debug`, also log why every blacklisted provider was blocked                                                                                                                                     |
 
 Every option with its default value, ready to copy into `opencode.jsonc` and tweak
 granularly (you normally never need to set any of these):
@@ -246,10 +246,10 @@ granularly (you normally never need to set any of these):
         "statsDays": 30,
         "statsCacheMinutes": 10,
         "debug": false,
-        "debugBlacklistReasons": false
-      }
-    }
-  ]
+        "debugBlacklistReasons": false,
+      },
+    },
+  ],
 }
 ```
 

@@ -1,10 +1,10 @@
 /** bun:sqlite access layer: per-model fetch/ranking state, hot routing snapshot. */
 
-import { Database, type Statement } from "bun:sqlite"
-import { mkdirSync } from "node:fs"
-import { homedir } from "node:os"
-import { dirname, join } from "node:path"
-import { baseModelSlug } from "./openrouter"
+import { Database, type Statement } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { baseModelSlug } from "./openrouter";
 
 /**
  * Normalized cross-provider model key: lowercase, dots -> dashes, variant suffixes
@@ -13,49 +13,49 @@ import { baseModelSlug } from "./openrouter"
  * all line up per family.
  */
 export function normalizeModelKey(modelId: string): string {
-  const sliced = baseModelSlug((modelId ?? "").trim())
-  return sliced.toLowerCase().replace(/\./g, "-")
+  const sliced = baseModelSlug((modelId ?? "").trim());
+  return sliced.toLowerCase().replace(/\./g, "-");
 }
 
 export interface FetchRow {
-  model: string
-  last_fetched: number | null
-  last_attempt: number | null
-  attempts: number
-  retry_after: number | null
-  survivors_json: string | null
-  blacklist_json: string | null
-  mode: string | null
-  computed_at: number | null
-  details_json: string | null
-  blacklist_reasons_json: string | null
-  updated_at: number
+  model: string;
+  last_fetched: number | null;
+  last_attempt: number | null;
+  attempts: number;
+  retry_after: number | null;
+  survivors_json: string | null;
+  blacklist_json: string | null;
+  mode: string | null;
+  computed_at: number | null;
+  details_json: string | null;
+  blacklist_reasons_json: string | null;
+  updated_at: number;
 }
 
 /** Compact routing snapshot: the only data the request path needs. */
 export interface RoutingSnapshot {
-  survivors: string[]
-  blacklist: string[]
-  computedAt: number
-  mode?: "free" | "cheapest"
+  survivors: string[];
+  blacklist: string[];
+  computedAt: number;
+  mode?: "free" | "cheapest";
 }
 
 /** Full snapshot used by tests, inspection and debug logging. */
 export interface RankingSnapshot extends RoutingSnapshot {
-  rankings: unknown[]
-  blacklistReasons?: Record<string, string[]>
+  rankings: unknown[];
+  blacklistReasons?: Record<string, string[]>;
 }
 
 /** In-memory state for one model: fetch bookkeeping plus the compact routing. */
 export interface RoutingState {
-  model: string
-  lastFetched: number | null
-  lastAttempt: number | null
-  attempts: number
-  retryAfter: number | null
-  routing?: RoutingSnapshot
-  details?: unknown[]
-  blacklistReasons?: Record<string, string[]>
+  model: string;
+  lastFetched: number | null;
+  lastAttempt: number | null;
+  attempts: number;
+  retryAfter: number | null;
+  routing?: RoutingSnapshot;
+  details?: unknown[];
+  blacklistReasons?: Record<string, string[]>;
 }
 
 const SCHEMA = `
@@ -73,7 +73,7 @@ const SCHEMA = `
     blacklist_reasons_json TEXT,
     updated_at INTEGER
   );
-`
+`;
 
 const MIGRATION_COLUMNS: Array<[string, string]> = [
   ["last_attempt", "INTEGER"],
@@ -85,33 +85,33 @@ const MIGRATION_COLUMNS: Array<[string, string]> = [
   ["computed_at", "INTEGER"],
   ["details_json", "TEXT"],
   ["blacklist_reasons_json", "TEXT"],
-]
+];
 
 const SELECT_COLUMNS = `model, last_fetched, last_attempt, attempts, retry_after,
-  survivors_json, blacklist_json, mode, computed_at, details_json, blacklist_reasons_json, updated_at`
+  survivors_json, blacklist_json, mode, computed_at, details_json, blacklist_reasons_json, updated_at`;
 
 const SELECT_COLUMNS_LEAN = `model, last_fetched, last_attempt, attempts, retry_after,
-  survivors_json, blacklist_json, mode, computed_at, updated_at`
+  survivors_json, blacklist_json, mode, computed_at, updated_at`;
 
 function openPath(explicit?: string): string {
-  if (explicit) return explicit
-  const xdg = process.env.XDG_DATA_HOME
-  const base = xdg ? join(xdg, "opencode") : join(homedir(), ".local", "share", "opencode")
-  return join(base, "openrouter-optimizer.db")
+  if (explicit) return explicit;
+  const xdg = process.env.XDG_DATA_HOME;
+  const base = xdg ? join(xdg, "opencode") : join(homedir(), ".local", "share", "opencode");
+  return join(base, "openrouter-optimizer.db");
 }
 
 function parseBlacklist(json: string | null): string[] | null {
-  if (json === null) return []
+  if (json === null) return [];
   try {
-    const parsed = JSON.parse(json)
-    if (!Array.isArray(parsed)) return null
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed)) return null;
     // A blacklist entry that is not a string means the row is damaged. Treat the
     // whole snapshot as unreadable so the next request re-ranks instead of silently
     // dropping a provider from the blacklist and re-allowing its traffic.
-    if (parsed.some((value) => typeof value !== "string")) return null
-    return parsed as string[]
+    if (parsed.some((value) => typeof value !== "string")) return null;
+    return parsed as string[];
   } catch {
-    return null
+    return null;
   }
 }
 
@@ -124,22 +124,24 @@ function parseBlacklist(json: string | null): string[] | null {
  * routing snapshot.
  */
 function parseSurvivors(json: string | null): string[] | null {
-  if (json === null) return null
+  if (json === null) return null;
   try {
-    const parsed = JSON.parse(json)
-    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : null
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string")
+      : null;
   } catch {
-    return null
+    return null;
   }
 }
 
 function parseDetails(json: string | null): unknown[] | undefined {
-  if (!json) return undefined
+  if (!json) return undefined;
   try {
-    const parsed = JSON.parse(json)
-    return Array.isArray(parsed) ? parsed : undefined
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed : undefined;
   } catch {
-    return undefined
+    return undefined;
   }
 }
 
@@ -148,31 +150,35 @@ function parseDetails(json: string | null): unknown[] | undefined {
  * malformed value just means no reasons are shown, never a routing change.
  */
 function parseBlacklistReasons(json: string | null): Record<string, string[]> | undefined {
-  if (!json) return undefined
+  if (!json) return undefined;
   try {
-    const parsed: unknown = JSON.parse(json)
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined
-    const out: Record<string, string[]> = {}
+    const parsed: unknown = JSON.parse(json);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const out: Record<string, string[]> = {};
     for (const [slug, reasons] of Object.entries(parsed)) {
-      if (slug.length === 0 || !Array.isArray(reasons) || reasons.some((r) => typeof r !== "string")) {
-        return undefined
+      if (
+        slug.length === 0 ||
+        !Array.isArray(reasons) ||
+        reasons.some((r) => typeof r !== "string")
+      ) {
+        return undefined;
       }
-      out[slug] = reasons as string[]
+      out[slug] = reasons as string[];
     }
-    return out
+    return out;
   } catch {
-    return undefined
+    return undefined;
   }
 }
 
 function modeOf(value: string | null): "free" | "cheapest" {
-  return value === "free" ? "free" : "cheapest"
+  return value === "free" ? "free" : "cheapest";
 }
 
 /** Build the in-memory state from a stored row. Parsing stays in one place. */
 export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingState {
-  const survivors = parseSurvivors(row.survivors_json)
-  const blacklist = parseBlacklist(row.blacklist_json)
+  const survivors = parseSurvivors(row.survivors_json);
+  const blacklist = parseBlacklist(row.blacklist_json);
   const routing: RoutingSnapshot | undefined =
     survivors !== null && blacklist !== null
       ? {
@@ -181,7 +187,7 @@ export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingS
           computedAt: row.computed_at ?? row.updated_at,
           mode: modeOf(row.mode),
         }
-      : undefined
+      : undefined;
   return {
     model: row.model,
     lastFetched: row.last_fetched,
@@ -191,7 +197,7 @@ export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingS
     routing,
     details: withDetails ? parseDetails(row.details_json) : undefined,
     blacklistReasons: withDetails ? parseBlacklistReasons(row.blacklist_reasons_json) : undefined,
-  }
+  };
 }
 
 /**
@@ -199,49 +205,53 @@ export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingS
  * the compact columns, then reclaims the legacy write-only columns. Safe on every open.
  */
 function migrate(db: Database): void {
-  const columns = db.prepare(`PRAGMA table_info(fetches)`).all() as Array<{ name: string }>
-  const names = new Set(columns.map((column) => column.name))
-  const hadLegacy = names.has("rankings_json") || names.has("endpoints_json")
+  const columns = db.prepare(`PRAGMA table_info(fetches)`).all() as Array<{ name: string }>;
+  const names = new Set(columns.map((column) => column.name));
+  const hadLegacy = names.has("rankings_json") || names.has("endpoints_json");
 
   for (const [name, declaration] of MIGRATION_COLUMNS) {
-    if (names.has(name)) continue
+    if (names.has(name)) continue;
     try {
-      db.exec(`ALTER TABLE fetches ADD COLUMN ${name} ${declaration}`)
+      db.exec(`ALTER TABLE fetches ADD COLUMN ${name} ${declaration}`);
     } catch {
       // Another process may have won the race; verified below.
     }
   }
   const after = new Set(
-    (db.prepare(`PRAGMA table_info(fetches)`).all() as Array<{ name: string }>).map((column) => column.name),
-  )
+    (db.prepare(`PRAGMA table_info(fetches)`).all() as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
   for (const [name] of MIGRATION_COLUMNS) {
-    if (!after.has(name)) throw new Error(`optimizer db migration failed: missing column ${name}`)
+    if (!after.has(name)) throw new Error(`optimizer db migration failed: missing column ${name}`);
   }
-  if (!hadLegacy) return
+  if (!hadLegacy) return;
 
   if (names.has("rankings_json")) {
     try {
       const rows = db
-        .prepare(`SELECT model, rankings_json, updated_at FROM fetches WHERE rankings_json IS NOT NULL AND survivors_json IS NULL`)
-        .all() as Array<{ model: string; rankings_json: string; updated_at: number }>
+        .prepare(
+          `SELECT model, rankings_json, updated_at FROM fetches WHERE rankings_json IS NOT NULL AND survivors_json IS NULL`,
+        )
+        .all() as Array<{ model: string; rankings_json: string; updated_at: number }>;
       if (rows.length > 0) {
         const update = db.prepare(`
           UPDATE fetches SET survivors_json = ?, blacklist_json = ?, mode = ?, computed_at = ?, details_json = ?, updated_at = ?
           WHERE model = ?
-        `)
+        `);
         const backfill = db.transaction((batch: typeof rows) => {
           for (const row of batch) {
             try {
               const parsed = JSON.parse(row.rankings_json) as {
-                survivors?: unknown
-                blacklist?: unknown
-                mode?: unknown
-                computedAt?: unknown
-                rankings?: unknown
-              }
-              const survivors = Array.isArray(parsed.survivors) ? parsed.survivors : []
-              const blacklist = Array.isArray(parsed.blacklist) ? parsed.blacklist : []
-              const details = Array.isArray(parsed.rankings) ? parsed.rankings : []
+                survivors?: unknown;
+                blacklist?: unknown;
+                mode?: unknown;
+                computedAt?: unknown;
+                rankings?: unknown;
+              };
+              const survivors = Array.isArray(parsed.survivors) ? parsed.survivors : [];
+              const blacklist = Array.isArray(parsed.blacklist) ? parsed.blacklist : [];
+              const details = Array.isArray(parsed.rankings) ? parsed.rankings : [];
               update.run(
                 JSON.stringify(survivors),
                 JSON.stringify(blacklist),
@@ -250,13 +260,13 @@ function migrate(db: Database): void {
                 details.length > 0 ? JSON.stringify(details) : null,
                 row.updated_at,
                 row.model,
-              )
+              );
             } catch {
               // A corrupt legacy row degrades to "no ranking" and is refreshed lazily.
             }
           }
-        })
-        backfill(rows)
+        });
+        backfill(rows);
       }
     } catch {
       // Another process dropped the legacy column while we were migrating.
@@ -265,16 +275,16 @@ function migrate(db: Database): void {
 
   // Release the legacy payloads. DROP is best-effort: older SQLite builds keep the
   // columns, but they are now NULL and never selected.
-  const legacyColumns = ["rankings_json", "endpoints_json"].filter((name) => names.has(name))
+  const legacyColumns = ["rankings_json", "endpoints_json"].filter((name) => names.has(name));
   if (legacyColumns.length > 0) {
     try {
-      db.exec(`UPDATE fetches SET ${legacyColumns.map((name) => `${name} = NULL`).join(", ")}`)
+      db.exec(`UPDATE fetches SET ${legacyColumns.map((name) => `${name} = NULL`).join(", ")}`);
     } catch {
       // ignored, another process may have dropped them
     }
     for (const name of legacyColumns) {
       try {
-        db.exec(`ALTER TABLE fetches DROP COLUMN ${name}`)
+        db.exec(`ALTER TABLE fetches DROP COLUMN ${name}`);
       } catch {
         // ignored
       }
@@ -283,42 +293,44 @@ function migrate(db: Database): void {
 }
 
 export class OptimizerDb {
-  private readonly db: Database
-  private readonly selectFetch: Statement
-  private readonly selectAll: Statement
-  private readonly selectAllLean: Statement
-  private readonly insertFetchRow: Statement
-  private readonly saveRefreshStmt: Statement
-  private readonly recordFailureStmt: Statement
-  private readonly upsertRanking: Statement
-  private readonly touchFetch: Statement
-  private readonly resetUnreadableStmt: Statement
-  private closed = false
+  private readonly db: Database;
+  private readonly selectFetch: Statement;
+  private readonly selectAll: Statement;
+  private readonly selectAllLean: Statement;
+  private readonly insertFetchRow: Statement;
+  private readonly saveRefreshStmt: Statement;
+  private readonly recordFailureStmt: Statement;
+  private readonly upsertRanking: Statement;
+  private readonly touchFetch: Statement;
+  private readonly resetUnreadableStmt: Statement;
+  private closed = false;
 
   constructor(path?: string) {
-    const file = openPath(path)
-    const dir = dirname(file)
-    if (file !== ":memory:" && dir && dir !== ".") mkdirSync(dir, { recursive: true })
-    this.db = new Database(file, { create: true })
-    this.db.exec("PRAGMA journal_mode = WAL;")
-    this.db.exec("PRAGMA synchronous = NORMAL;")
-    this.db.exec("PRAGMA busy_timeout = 3000;")
-    this.db.exec(SCHEMA)
-    migrate(this.db)
+    const file = openPath(path);
+    const dir = dirname(file);
+    if (file !== ":memory:" && dir && dir !== ".") mkdirSync(dir, { recursive: true });
+    this.db = new Database(file, { create: true });
+    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA synchronous = NORMAL;");
+    this.db.exec("PRAGMA busy_timeout = 3000;");
+    this.db.exec(SCHEMA);
+    migrate(this.db);
     // Usage is no longer tracked by the plugin (dropped in favor of OpenCode's own
     // `stats --json` data); remove the legacy table from pre-existing DB files.
-    this.db.exec("DROP TABLE IF EXISTS usage;")
+    this.db.exec("DROP TABLE IF EXISTS usage;");
 
-    this.selectFetch = this.db.prepare(`SELECT ${SELECT_COLUMNS} FROM fetches WHERE model = ?`)
-    this.selectAll = this.db.prepare(`SELECT ${SELECT_COLUMNS} FROM fetches`)
-    this.selectAllLean = this.db.prepare(`SELECT ${SELECT_COLUMNS_LEAN} FROM fetches`)
-    this.insertFetchRow = this.db.prepare(`INSERT OR IGNORE INTO fetches (model, updated_at) VALUES (?, ?)`)
+    this.selectFetch = this.db.prepare(`SELECT ${SELECT_COLUMNS} FROM fetches WHERE model = ?`);
+    this.selectAll = this.db.prepare(`SELECT ${SELECT_COLUMNS} FROM fetches`);
+    this.selectAllLean = this.db.prepare(`SELECT ${SELECT_COLUMNS_LEAN} FROM fetches`);
+    this.insertFetchRow = this.db.prepare(
+      `INSERT OR IGNORE INTO fetches (model, updated_at) VALUES (?, ?)`,
+    );
     this.touchFetch = this.db.prepare(`
       INSERT INTO fetches (model, last_fetched, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(model) DO UPDATE SET
         last_fetched = excluded.last_fetched,
         updated_at = excluded.updated_at
-    `)
+    `);
     this.saveRefreshStmt = this.db.prepare(`
       INSERT INTO fetches
         (model, last_fetched, last_attempt, attempts, retry_after,
@@ -336,7 +348,7 @@ export class OptimizerDb {
         details_json = excluded.details_json,
         blacklist_reasons_json = excluded.blacklist_reasons_json,
         updated_at = excluded.updated_at
-    `)
+    `);
     this.recordFailureStmt = this.db.prepare(`
       INSERT INTO fetches (model, last_attempt, attempts, retry_after, updated_at)
       VALUES (?, ?, 1, ?, ?)
@@ -345,7 +357,7 @@ export class OptimizerDb {
         attempts = fetches.attempts + 1,
         retry_after = excluded.retry_after,
         updated_at = excluded.updated_at
-    `)
+    `);
     this.upsertRanking = this.db.prepare(`
       INSERT INTO fetches (model, survivors_json, blacklist_json, mode, computed_at, details_json, blacklist_reasons_json, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -357,7 +369,7 @@ export class OptimizerDb {
         details_json = excluded.details_json,
         blacklist_reasons_json = excluded.blacklist_reasons_json,
         updated_at = excluded.updated_at
-    `)
+    `);
     // A row that claims a fresh ranking but carries none must stop claiming it:
     // "fresh" without a ranking routes nothing while it looks fresh for the
     // whole TTL. Reset it to "never ranked" so the next request re-ranks it.
@@ -373,37 +385,37 @@ export class OptimizerDb {
         computed_at = NULL,
         updated_at = ?
       WHERE model = ?
-    `)
+    `);
   }
 
   /** Throwing early beats a confusing "database is closed" sqlite error mid-statement. */
   private assertOpen(): void {
-    if (this.closed) throw new Error("optimizer db is closed")
+    if (this.closed) throw new Error("optimizer db is closed");
   }
 
   /** Exact model row; last_fetched === null means "prices were never fetched". */
   getFetch(model: string): FetchRow | undefined {
-    this.assertOpen()
-    return this.selectFetch.get(model) as FetchRow | undefined
+    this.assertOpen();
+    return this.selectFetch.get(model) as FetchRow | undefined;
   }
 
   /** One INSERT OR IGNORE plus one SELECT, instead of SELECT/INSERT/SELECT. */
   ensureFetchRow(model: string, now: number): FetchRow {
-    this.assertOpen()
-    this.insertFetchRow.run(model, now)
-    return this.selectFetch.get(model) as FetchRow
+    this.assertOpen();
+    this.insertFetchRow.run(model, now);
+    return this.selectFetch.get(model) as FetchRow;
   }
 
   /** All persisted model states, used to warm the in-process routing cache. */
   loadRoutingStates(withDetails = true): RoutingState[] {
-    const statement = withDetails ? this.selectAll : this.selectAllLean
-    return (statement.all() as FetchRow[]).map((row) => routingStateFromRow(row, withDetails))
+    const statement = withDetails ? this.selectAll : this.selectAllLean;
+    return (statement.all() as FetchRow[]).map((row) => routingStateFromRow(row, withDetails));
   }
 
   /** Compact routing for one model, or undefined when nothing was ranked yet. */
   getRouting(model: string): RoutingSnapshot | undefined {
-    const row = this.getFetch(model)
-    return row ? routingStateFromRow(row).routing : undefined
+    const row = this.getFetch(model);
+    return row ? routingStateFromRow(row).routing : undefined;
   }
 
   /** Persist one successful refresh in a single UPSERT (QW-8). */
@@ -414,7 +426,7 @@ export class OptimizerDb {
     details?: unknown[],
     blacklistReasons?: Record<string, string[]>,
   ): void {
-    this.assertOpen()
+    this.assertOpen();
     this.saveRefreshStmt.run(
       model,
       now,
@@ -424,15 +436,17 @@ export class OptimizerDb {
       routing.mode ?? "cheapest",
       routing.computedAt,
       details && details.length > 0 ? JSON.stringify(details) : null,
-      blacklistReasons && Object.keys(blacklistReasons).length > 0 ? JSON.stringify(blacklistReasons) : null,
+      blacklistReasons && Object.keys(blacklistReasons).length > 0
+        ? JSON.stringify(blacklistReasons)
+        : null,
       now,
-    )
+    );
   }
 
   /** Persist a failed attempt with its backoff deadline. */
   recordFailure(model: string, now: number, retryAfter: number): void {
-    this.assertOpen()
-    this.recordFailureStmt.run(model, now, retryAfter, now)
+    this.assertOpen();
+    this.recordFailureStmt.run(model, now, retryAfter, now);
   }
 
   /**
@@ -442,22 +456,26 @@ export class OptimizerDb {
    * no ranking is what makes the plugin warn about it on every start.
    */
   resetUnreadableRanking(model: string): void {
-    this.assertOpen()
-    this.resetUnreadableStmt.run(Date.now(), model)
+    this.assertOpen();
+    this.resetUnreadableStmt.run(Date.now(), model);
   }
 
   /** Legacy-compatible fetch write: last_fetched only, no endpoint payload. */
   recordFetch(model: string, _endpoints: unknown, now: number): void {
-    this.assertOpen()
-    this.touchFetch.run(model, now, now)
+    this.assertOpen();
+    this.touchFetch.run(model, now, now);
   }
 
   getRankings(model: string): RankingSnapshot | undefined {
-    const row = this.getFetch(model)
-    if (!row) return undefined
-    const state = routingStateFromRow(row)
-    if (!state.routing) return undefined
-    return { ...state.routing, rankings: state.details ?? [], blacklistReasons: state.blacklistReasons }
+    const row = this.getFetch(model);
+    if (!row) return undefined;
+    const state = routingStateFromRow(row);
+    if (!state.routing) return undefined;
+    return {
+      ...state.routing,
+      rankings: state.details ?? [],
+      blacklistReasons: state.blacklistReasons,
+    };
   }
 
   /** Rankings write used by tests and tooling; the plugin uses saveRefresh. */
@@ -473,16 +491,16 @@ export class OptimizerDb {
         ? JSON.stringify(ranking.blacklistReasons)
         : null,
       Date.now(),
-    )
+    );
   }
 
   state(): { fetches: FetchRow[] } {
-    return { fetches: this.selectAll.all() as FetchRow[] }
+    return { fetches: this.selectAll.all() as FetchRow[] };
   }
 
   close(): void {
-    if (this.closed) return
-    this.closed = true
-    this.db.close()
+    if (this.closed) return;
+    this.closed = true;
+    this.db.close();
   }
 }

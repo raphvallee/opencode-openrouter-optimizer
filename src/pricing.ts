@@ -30,12 +30,12 @@
 
 /** Prices are strings like "0.0000001", USD per token, base rate before discount. */
 export interface EndpointPricing {
-  prompt: string | number
-  completion: string | number
-  input_cache_read?: string | number | null
-  input_cache_write?: string | number | null
-  discount?: number | string | null
-  overrides?: PricingOverride[]
+  prompt: string | number;
+  completion: string | number;
+  input_cache_read?: string | number | null;
+  input_cache_write?: string | number | null;
+  discount?: number | string | null;
+  overrides?: PricingOverride[];
 }
 
 /**
@@ -44,31 +44,28 @@ export interface EndpointPricing {
  * skipped entirely (future grammar additions must not be guessed at).
  */
 export interface PricingOverride {
-  min_prompt_tokens?: number
-  utc_start?: number
-  utc_end?: number
-  utc_days?: string[]
-  prompt?: string | number
-  completion?: string | number
-  input_cache_read?: string | number | null
-  input_cache_write?: string | number | null
+  min_prompt_tokens?: number;
+  utc_start?: number;
+  utc_end?: number;
+  utc_days?: string[];
+  prompt?: string | number;
+  completion?: string | number;
+  input_cache_read?: string | number | null;
+  input_cache_write?: string | number | null;
   /** Other price keys (audio, request, image, ...) exist but never enter the model. */
-  [key: string]: unknown
+  [key: string]: unknown;
 }
 
 export interface Rates {
-  inputRate: number
-  outputRate: number
-  readRate: number
-  writeRate: number
+  inputRate: number;
+  outputRate: number;
+  readRate: number;
+  writeRate: number;
   /** The discount factor that was applied (0 when the endpoint has no discount). */
-  discount: number
+  discount: number;
 }
 
-type ParsedPrice =
-  | { kind: "absent" }
-  | { kind: "known"; value: number }
-  | { kind: "invalid" }
+type ParsedPrice = { kind: "absent" } | { kind: "known"; value: number } | { kind: "invalid" };
 
 /**
  * Parse a price without guessing. "absent" means the field was omitted; "invalid" means
@@ -77,31 +74,33 @@ type ParsedPrice =
  * while an invalid one is unknown pricing that must not be silently treated as $0.
  */
 function parsePrice(value: string | number | null | undefined): ParsedPrice {
-  if (value === null || value === undefined) return { kind: "absent" }
+  if (value === null || value === undefined) return { kind: "absent" };
   if (typeof value === "number") {
-    return Number.isFinite(value) && value >= 0 ? { kind: "known", value } : { kind: "invalid" }
+    return Number.isFinite(value) && value >= 0 ? { kind: "known", value } : { kind: "invalid" };
   }
-  if (typeof value !== "string") return { kind: "invalid" }
-  const trimmed = value.trim()
-  if (trimmed === "") return { kind: "invalid" }
-  const parsed = Number(trimmed)
-  return Number.isFinite(parsed) && parsed >= 0 ? { kind: "known", value: parsed } : { kind: "invalid" }
+  if (typeof value !== "string") return { kind: "invalid" };
+  const trimmed = value.trim();
+  if (trimmed === "") return { kind: "invalid" };
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? { kind: "known", value: parsed }
+    : { kind: "invalid" };
 }
 
 /** Required price: absent or invalid is unknown (null). */
 function parseRequiredPrice(value: string | number | null | undefined): number | null {
-  const parsed = parsePrice(value)
-  return parsed.kind === "known" ? parsed.value : null
+  const parsed = parsePrice(value);
+  return parsed.kind === "known" ? parsed.value : null;
 }
 
 /** Optional discount: absent or invalid is treated as no discount. */
 function parseDiscount(value: string | number | null | undefined): number {
-  const parsed = parsePrice(value)
-  return parsed.kind === "known" ? parsed.value : 0
+  const parsed = parsePrice(value);
+  return parsed.kind === "known" ? parsed.value : 0;
 }
 
 /** Condition keys that scope when an override entry applies. */
-const OVERRIDE_CONDITION_KEYS = new Set(["min_prompt_tokens", "utc_start", "utc_end", "utc_days"])
+const OVERRIDE_CONDITION_KEYS = new Set(["min_prompt_tokens", "utc_start", "utc_end", "utc_days"]);
 
 /** Price keys OpenRouter may put in an override; only the modeled four change rates. */
 const OVERRIDE_PRICE_KEYS = new Set([
@@ -119,14 +118,14 @@ const OVERRIDE_PRICE_KEYS = new Set([
   "internal_reasoning",
   "input_cache_write_1h",
   "input_audio_cache",
-])
+]);
 
 /** The raw prices (base values, possibly replaced by applicable overrides). */
 interface TierPrices {
-  prompt: string | number | null | undefined
-  completion: string | number | null | undefined
-  input_cache_read: string | number | null | undefined
-  input_cache_write: string | number | null | undefined
+  prompt: string | number | null | undefined;
+  completion: string | number | null | undefined;
+  input_cache_read: string | number | null | undefined;
+  input_cache_write: string | number | null | undefined;
 }
 
 /**
@@ -135,10 +134,15 @@ interface TierPrices {
  * remain the documented default). A tiered entry applies strictly above its threshold.
  */
 function applicableOverride(entry: PricingOverride, contextSize: number): boolean {
-  if (!understoodEntry(entry)) return false
-  if (entry.min_prompt_tokens === undefined) return true
-  const threshold = entry.min_prompt_tokens
-  return typeof threshold === "number" && Number.isFinite(threshold) && threshold >= 0 && contextSize > threshold
+  if (!understoodEntry(entry)) return false;
+  if (entry.min_prompt_tokens === undefined) return true;
+  const threshold = entry.min_prompt_tokens;
+  return (
+    typeof threshold === "number" &&
+    Number.isFinite(threshold) &&
+    threshold >= 0 &&
+    contextSize > threshold
+  );
 }
 
 /**
@@ -148,10 +152,11 @@ function applicableOverride(entry: PricingOverride, contextSize: number): boolea
  */
 function understoodEntry(entry: PricingOverride): boolean {
   for (const key of Object.keys(entry)) {
-    if (!OVERRIDE_CONDITION_KEYS.has(key) && !OVERRIDE_PRICE_KEYS.has(key)) return false
+    if (!OVERRIDE_CONDITION_KEYS.has(key) && !OVERRIDE_PRICE_KEYS.has(key)) return false;
   }
-  if (entry.utc_start !== undefined || entry.utc_end !== undefined || entry.utc_days !== undefined) return false
-  return true
+  if (entry.utc_start !== undefined || entry.utc_end !== undefined || entry.utc_days !== undefined)
+    return false;
+  return true;
 }
 
 /**
@@ -166,17 +171,22 @@ function resolveTierPrices(pricing: EndpointPricing, contextSize: number | undef
     completion: pricing.completion,
     input_cache_read: pricing.input_cache_read,
     input_cache_write: pricing.input_cache_write,
-  }
-  if (contextSize === undefined || !Number.isFinite(contextSize) || !Array.isArray(pricing.overrides)) return tier
+  };
+  if (
+    contextSize === undefined ||
+    !Number.isFinite(contextSize) ||
+    !Array.isArray(pricing.overrides)
+  )
+    return tier;
   for (const entry of pricing.overrides) {
-    if (typeof entry !== "object" || entry === null) continue
-    if (!applicableOverride(entry, contextSize)) continue
-    if ("prompt" in entry) tier.prompt = entry.prompt
-    if ("completion" in entry) tier.completion = entry.completion
-    if ("input_cache_read" in entry) tier.input_cache_read = entry.input_cache_read
-    if ("input_cache_write" in entry) tier.input_cache_write = entry.input_cache_write
+    if (typeof entry !== "object" || entry === null) continue;
+    if (!applicableOverride(entry, contextSize)) continue;
+    if ("prompt" in entry) tier.prompt = entry.prompt;
+    if ("completion" in entry) tier.completion = entry.completion;
+    if ("input_cache_read" in entry) tier.input_cache_read = entry.input_cache_read;
+    if ("input_cache_write" in entry) tier.input_cache_write = entry.input_cache_write;
   }
-  return tier
+  return tier;
 }
 
 /**
@@ -199,21 +209,21 @@ export function hasKnownPricing(pricing: EndpointPricing, contextSize?: number):
     parsePrice(pricing.completion).kind !== "known" ||
     parsePrice(pricing.input_cache_write).kind === "invalid"
   ) {
-    return false
+    return false;
   }
   if (Array.isArray(pricing.overrides)) {
     for (const entry of pricing.overrides) {
-      if (typeof entry !== "object" || entry === null) continue
+      if (typeof entry !== "object" || entry === null) continue;
       // Conservative mode (no context size) checks every billable entry; tier-aware
       // mode checks only the entries applicable at that size.
-      if (contextSize !== undefined && !applicableOverride(entry, contextSize)) continue
-      if (!understoodEntry(entry)) continue
-      if (parsePrice(entry.prompt).kind === "invalid") return false
-      if (parsePrice(entry.completion).kind === "invalid") return false
-      if (parsePrice(entry.input_cache_write).kind === "invalid") return false
+      if (contextSize !== undefined && !applicableOverride(entry, contextSize)) continue;
+      if (!understoodEntry(entry)) continue;
+      if (parsePrice(entry.prompt).kind === "invalid") return false;
+      if (parsePrice(entry.completion).kind === "invalid") return false;
+      if (parsePrice(entry.input_cache_write).kind === "invalid") return false;
     }
   }
-  return true
+  return true;
 }
 
 /**
@@ -226,75 +236,79 @@ export function hasKnownPricing(pricing: EndpointPricing, contextSize?: number):
  * that size: an endpoint free below a threshold is paid above it, and vice versa.
  */
 export function isFreePricing(pricing: EndpointPricing, contextSize?: number): boolean {
-  const tier = resolveTierPrices(pricing, contextSize)
-  const prompt = parsePrice(tier.prompt)
-  const completion = parsePrice(tier.completion)
-  if (prompt.kind !== "known" || completion.kind !== "known") return false
-  if (prompt.value !== 0 || completion.value !== 0) return false
-  const read = parsePrice(tier.input_cache_read)
-  const readRate = read.kind === "known" ? read.value : prompt.value
-  if (readRate !== 0) return false
-  const write = parsePrice(tier.input_cache_write)
-  if (write.kind === "invalid") return false
-  if (write.kind === "known" && write.value !== 0) return false
-  return true
+  const tier = resolveTierPrices(pricing, contextSize);
+  const prompt = parsePrice(tier.prompt);
+  const completion = parsePrice(tier.completion);
+  if (prompt.kind !== "known" || completion.kind !== "known") return false;
+  if (prompt.value !== 0 || completion.value !== 0) return false;
+  const read = parsePrice(tier.input_cache_read);
+  const readRate = read.kind === "known" ? read.value : prompt.value;
+  if (readRate !== 0) return false;
+  const write = parsePrice(tier.input_cache_write);
+  if (write.kind === "invalid") return false;
+  if (write.kind === "known" && write.value !== 0) return false;
+  return true;
 }
 
 export function effectiveRates(pricing: EndpointPricing, contextSize?: number): Rates {
-  const tier = resolveTierPrices(pricing, contextSize)
-  const rawDiscount = parseDiscount(pricing.discount)
+  const tier = resolveTierPrices(pricing, contextSize);
+  const rawDiscount = parseDiscount(pricing.discount);
   // Discounts theoretically live in [0, 1]; anything outside is treated as no discount.
-  const discount = rawDiscount > 0 && rawDiscount <= 1 ? rawDiscount : 0
-  const scale = 1 - discount
-  const inputRate = (parseRequiredPrice(tier.prompt) ?? 0) * scale
-  const read = parsePrice(tier.input_cache_read)
+  const discount = rawDiscount > 0 && rawDiscount <= 1 ? rawDiscount : 0;
+  const scale = 1 - discount;
+  const inputRate = (parseRequiredPrice(tier.prompt) ?? 0) * scale;
+  const read = parsePrice(tier.input_cache_read);
   // No cache read price means "no cache": cached input is billed at the input rate.
-  const readRate = (read.kind === "known" ? read.value : (parseRequiredPrice(tier.prompt) ?? 0)) * scale
-  const write = parsePrice(tier.input_cache_write)
+  const readRate =
+    (read.kind === "known" ? read.value : (parseRequiredPrice(tier.prompt) ?? 0)) * scale;
+  const write = parsePrice(tier.input_cache_write);
   // An absent cache-write price is 0. Invalid values are unknown pricing and are
   // filtered by rankProviders via hasKnownPricing before a ranking is computed.
-  const writeRate = (write.kind === "known" ? write.value : 0) * scale
+  const writeRate = (write.kind === "known" ? write.value : 0) * scale;
   return {
     inputRate,
     outputRate: (parseRequiredPrice(tier.completion) ?? 0) * scale,
     readRate,
     writeRate,
     discount,
-  }
+  };
 }
 
 export interface RequestProfile {
   /** Average total input tokens per request (cached + uncached). */
-  avgInput: number
+  avgInput: number;
   /** Average output tokens per request (completion + reasoning). */
-  avgOutput: number
+  avgOutput: number;
   /** Cache hit rate in [0, 1]. */
-  cacheHitRate: number
+  cacheHitRate: number;
   /** Number of requests the profile was computed over. */
-  numRequests: number
+  numRequests: number;
 }
 
 export function perRequestCost(rates: Rates, profile: RequestProfile): number {
-  const h = Math.min(1, Math.max(0, profile.cacheHitRate))
+  const h = Math.min(1, Math.max(0, profile.cacheHitRate));
   const input =
-    profile.avgInput * (h * rates.readRate + (1 - h) * (rates.inputRate + rates.writeRate))
-  const output = profile.avgOutput * rates.outputRate
-  return input + output
+    profile.avgInput * (h * rates.readRate + (1 - h) * (rates.inputRate + rates.writeRate));
+  const output = profile.avgOutput * rates.outputRate;
+  return input + output;
 }
 
 export function totalCost(perRequest: number, numRequests: number): number {
-  return perRequest * numRequests
+  return perRequest * numRequests;
 }
 
-export function requestCost(pricing: EndpointPricing, profile: RequestProfile): { perRequest: number; rates: Rates } {
+export function requestCost(
+  pricing: EndpointPricing,
+  profile: RequestProfile,
+): { perRequest: number; rates: Rates } {
   // Loud guard: rankProviders filters with hasKnownPricing first, so reaching this with
   // unknown pricing means a caller bypassed the blacklist. Failing here is safer than
   // silently pricing an unknown cache write as $0.
   if (!hasKnownPricing(pricing, profile.avgInput)) {
-    throw new Error("requestCost called with unknown or unparseable pricing")
+    throw new Error("requestCost called with unknown or unparseable pricing");
   }
   // The profile's average input tokens stand in for the request's prompt size, which
   // is what context-tiered overrides key on.
-  const rates = effectiveRates(pricing, profile.avgInput)
-  return { perRequest: perRequestCost(rates, profile), rates }
+  const rates = effectiveRates(pricing, profile.avgInput);
+  return { perRequest: perRequestCost(rates, profile), rates };
 }

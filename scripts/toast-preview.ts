@@ -8,44 +8,44 @@
  * writes, so the failure is visible without running a live OpenCode session.
  */
 
-import { BoxRenderable, TextRenderable } from "@opentui/core"
-import { createTestRenderer } from "@opentui/core/testing"
+import { BoxRenderable, TextRenderable } from "@opentui/core";
+import { createTestRenderer } from "@opentui/core/testing";
 
-const WIDTH = 80
-const HEIGHT = 24
+const WIDTH = 80;
+const HEIGHT = 24;
 
 const MESSAGE =
-  "OpenRouter optimizer could not route vendor/model (no ranking available); the request was sent unfiltered."
+  "OpenRouter optimizer could not route vendor/model (no ranking available); the request was sent unfiltered.";
 
 const { renderer, renderOnce, flush, captureCharFrame, dispose } = await createTestRenderer({
   width: WIDTH,
   height: HEIGHT,
-})
+});
 
 // Mock transcript: a user prompt and a running-agent line, dimmed behind the toast.
 const transcript = new BoxRenderable(renderer, {
   backgroundColor: "#0e0e0e",
   width: WIDTH,
   height: HEIGHT,
-})
+});
 transcript.add(
   new TextRenderable(renderer, {
     content: "> fix the failing stats test",
     fg: "#c0c0c0",
   }),
-)
+);
 transcript.add(
   new TextRenderable(renderer, {
     content: "",
     height: 1,
   }),
-)
+);
 transcript.add(
   new TextRenderable(renderer, {
     content: "  [optimizer] routing vendor/model via OpenRouter...",
     fg: "#606060",
   }),
-)
+);
 
 // The host toast: bottom-right corner, error variant styling.
 const toast = new BoxRenderable(renderer, {
@@ -62,7 +62,7 @@ const toast = new BoxRenderable(renderer, {
   width: 73,
   height: 5,
   zIndex: 10,
-})
+});
 toast.add(
   new TextRenderable(renderer, {
     content: MESSAGE,
@@ -71,16 +71,16 @@ toast.add(
     wrapMode: "char",
     margin: 1,
   }),
-)
+);
 
-renderer.root.add(transcript)
-renderer.root.add(toast)
+renderer.root.add(transcript);
+renderer.root.add(toast);
 
-await renderOnce()
-await flush()
+await renderOnce();
+await flush();
 
-const frame = captureCharFrame()
-console.log("=== captured TUI frame ===")
-console.log(frame)
+const frame = captureCharFrame();
+console.log("=== captured TUI frame ===");
+console.log(frame);
 
-await dispose()
+await dispose();

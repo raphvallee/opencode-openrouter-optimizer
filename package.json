@@ -2,22 +2,37 @@
   "name": "opencode-openrouter-optimizer",
   "version": "0.1.0",
   "description": "OpenCode plugin that ranks OpenRouter providers by cost and injects a per-request provider blacklist to keep routes cheap.",
-  "type": "module",
+  "keywords": [
+    "cost-optimization",
+    "llm",
+    "opencode",
+    "opencode-plugin",
+    "openrouter",
+    "routing"
+  ],
   "license": "MIT",
+  "files": [
+    "index.ts",
+    "src",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
   "main": "./index.ts",
   "module": "./index.ts",
   "exports": {
     ".": "./index.ts",
     "./tui": "./src/tui.ts"
   },
-  "files": ["index.ts", "src", "scripts", "README.md", "LICENSE"],
-  "keywords": ["opencode", "opencode-plugin", "openrouter", "cost-optimization", "routing", "llm"],
-  "engines": {
-    "bun": ">=1.3.0"
-  },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "prepare": "husky",
     "inspect": "bun run scripts/inspect.ts",
     "selfcheck": "bun run scripts/selfcheck.ts",
     "debug:test": "bun --inspect-wait=6496 run test",
@@ -26,6 +41,18 @@
   },
   "dependencies": {
     "@opencode/plugin": "^2.2.5"
+  },
+  "devDependencies": {
+    "@opentui/core": "^0.8.0",
+    "@opentui/solid": "^0.8.0",
+    "@types/bun": "^1.4.4",
+    "bun-types": "^1.4.4",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "oxfmt": "^0.75.0",
+    "oxlint": "^1.90.0",
+    "solid-js": "^1.9.0",
+    "typescript": "^7.0.2"
   },
   "peerDependencies": {
     "@opentui/core": ">=0.8.0",
@@ -43,12 +70,13 @@
       "optional": true
     }
   },
-  "devDependencies": {
-    "@opentui/core": "^0.8.0",
-    "@opentui/solid": "^0.8.0",
-    "@types/bun": "^1.4.4",
-    "bun-types": "^1.4.4",
-    "solid-js": "^1.9.0",
-    "typescript": "^7.0.2"
+  "lint-staged": {
+    "*.{js,mjs,cjs,ts,mts,cts,jsx,tsx}": [
+      "oxlint --fix",
+      "oxfmt"
+    ]
+  },
+  "engines": {
+    "bun": ">=1.3.0"
   }
 }

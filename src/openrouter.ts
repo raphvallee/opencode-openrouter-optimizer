@@ -1,36 +1,36 @@
 /** OpenRouter HTTP clients (endpoints API: public; Activity API: management key). */
 
-import { providerSlug, type OpenRouterEndpoint } from "./ranking"
+import { providerSlug, type OpenRouterEndpoint } from "./ranking";
 
-const BASE_URL = "https://openrouter.ai/api/v1"
-const FRONTEND_BASE_URL = "https://openrouter.ai/api/frontend"
+const BASE_URL = "https://openrouter.ai/api/v1";
+const FRONTEND_BASE_URL = "https://openrouter.ai/api/frontend";
 
 export interface EndpointsResponse {
-  id: string
-  name: string
-  endpoints: OpenRouterEndpoint[]
+  id: string;
+  name: string;
+  endpoints: OpenRouterEndpoint[];
 }
 
 /** Activity rows from GET /api/v1/activity (last 30 completed UTC days). */
 export interface ActivityRow {
-  date: string
-  model: string
-  model_permaslug?: string
-  endpoint_id: string
-  provider_name: string
-  requests: number
-  prompt_tokens: number
-  completion_tokens: number
-  cached_tokens?: number
-  reasoning_tokens?: number
-  usage: number
+  date: string;
+  model: string;
+  model_permaslug?: string;
+  endpoint_id: string;
+  provider_name: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens?: number;
+  reasoning_tokens?: number;
+  usage: number;
 }
 
 export interface ActivityResult {
-  requests: number
-  promptTokens: number
-  completionTokens: number
-  cachedTokens: number
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
 }
 
 export class OpenRouterError extends Error {
@@ -38,67 +38,76 @@ export class OpenRouterError extends Error {
     message: string,
     readonly status: number,
   ) {
-    super(message)
+    super(message);
   }
 }
 
 /** Strip OpenRouter variant suffixes: ":free", ":nitro", "#variant". */
 export function baseModelSlug(model: string): string {
-  const hash = model.indexOf("#")
-  const stripped = hash === -1 ? model : model.slice(0, hash)
-  const colon = stripped.indexOf(":")
-  return colon === -1 ? stripped : stripped.slice(0, colon)
+  const hash = model.indexOf("#");
+  const stripped = hash === -1 ? model : model.slice(0, hash);
+  const colon = stripped.indexOf(":");
+  return colon === -1 ? stripped : stripped.slice(0, colon);
 }
 
 /** Some model refs carry a "provider/prefix:variant" compound (e.g. "x-ai/grok-4:free"). */
 export interface FetchOptions {
-  baseUrl?: string
-  timeoutMs?: number
-  signal?: AbortSignal
-  fetchImpl?: (input: string, init?: RequestInit) => Promise<Response>
+  baseUrl?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  fetchImpl?: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
-const DEFAULT_TIMEOUT_MS = 15_000
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 /** Overall deadline for one API call, composed with the plugin shutdown signal. */
 function requestSignal(options: FetchOptions): AbortSignal {
-  const timeout = AbortSignal.timeout(Math.max(1, options.timeoutMs ?? DEFAULT_TIMEOUT_MS))
-  return options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
+  const timeout = AbortSignal.timeout(Math.max(1, options.timeoutMs ?? DEFAULT_TIMEOUT_MS));
+  return options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
 }
 
-export async function fetchModelEndpoints(model: string, options: FetchOptions = {}): Promise<EndpointsResponse> {
-  const fetchImpl = options.fetchImpl ?? fetch
-  const base = options.baseUrl ?? BASE_URL
-  const signal = requestSignal(options)
+export async function fetchModelEndpoints(
+  model: string,
+  options: FetchOptions = {},
+): Promise<EndpointsResponse> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const base = options.baseUrl ?? BASE_URL;
+  const signal = requestSignal(options);
 
   async function get(slug: string): Promise<Response> {
     // The slug is already a URL path ("author/name[:variant]"); do not encode the "/".
     const response = await fetchImpl(`${base}/models/${slug}/endpoints`, {
       headers: { accept: "application/json" },
       signal,
-    })
-    return response
+    });
+    return response;
   }
 
-  let response = await get(model)
+  let response = await get(model);
   // Only a missing slug (404) is worth retrying without the variant suffix. Auth,
   // rate-limit and server errors come from the API, not the slug form: retrying
   // them just doubles the request pressure.
-  const stripped = baseModelSlug(model)
-  const variantStatus = response.status
+  const stripped = baseModelSlug(model);
+  const variantStatus = response.status;
   if (response.status === 404 && stripped !== model) {
-    response = await get(stripped)
+    response = await get(stripped);
   }
   if (!response.ok) {
-    const detail = response.status === variantStatus ? `${response.status}` : `${variantStatus} -> ${response.status}`
-    throw new OpenRouterError(`endpoints fetch failed for ${model}: HTTP ${detail}`, response.status)
+    const detail =
+      response.status === variantStatus
+        ? `${response.status}`
+        : `${variantStatus} -> ${response.status}`;
+    throw new OpenRouterError(
+      `endpoints fetch failed for ${model}: HTTP ${detail}`,
+      response.status,
+    );
   }
-  const payload = (await response.json()) as { data?: EndpointsResponse }
-  const data = payload?.data
+  const payload = (await response.json()) as { data?: EndpointsResponse };
+  const data = payload?.data;
   if (!data || !Array.isArray(data.endpoints)) {
-    throw new OpenRouterError(`unexpected endpoints payload for ${model}`, response.status)
+    throw new OpenRouterError(`unexpected endpoints payload for ${model}`, response.status);
   }
-  return data
+  return data;
 }
 
 /**
@@ -108,12 +117,12 @@ export async function fetchModelEndpoints(model: string, options: FetchOptions =
  * silently ranking from zero activity data.
  */
 function extractRows(payload: unknown): ActivityRow[] | undefined {
-  if (Array.isArray(payload)) return payload as ActivityRow[]
-  const data = (payload as { data?: unknown } | null)?.data
-  if (Array.isArray(data)) return data as ActivityRow[]
-  const nested = (data as { data?: unknown } | null)?.data
-  if (Array.isArray(nested)) return nested as ActivityRow[]
-  return undefined
+  if (Array.isArray(payload)) return payload as ActivityRow[];
+  const data = (payload as { data?: unknown } | null)?.data;
+  if (Array.isArray(data)) return data as ActivityRow[];
+  const nested = (data as { data?: unknown } | null)?.data;
+  if (Array.isArray(nested)) return nested as ActivityRow[];
+  return undefined;
 }
 
 /**
@@ -125,24 +134,24 @@ export async function fetchOpenRouterProfile(
   managementKey: string | undefined,
   options: FetchOptions = {},
 ): Promise<ActivityResult | undefined> {
-  if (!managementKey) return undefined
-  const fetchImpl = options.fetchImpl ?? fetch
-  const base = options.baseUrl ?? BASE_URL
+  if (!managementKey) return undefined;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const base = options.baseUrl ?? BASE_URL;
 
   const response = await fetchImpl(`${base}/activity`, {
     headers: { accept: "application/json", authorization: `Bearer ${managementKey}` },
     signal: requestSignal(options),
-  })
+  });
   if (!response.ok) {
-    throw new OpenRouterError(`activity fetch failed: HTTP ${response.status}`, response.status)
+    throw new OpenRouterError(`activity fetch failed: HTTP ${response.status}`, response.status);
   }
-  const payload = await response.json()
-  const rows = extractRows(payload)
+  const payload = await response.json();
+  const rows = extractRows(payload);
   if (!rows) {
-    throw new OpenRouterError(`unexpected activity payload for ${model}`, response.status)
+    throw new OpenRouterError(`unexpected activity payload for ${model}`, response.status);
   }
-  const target = baseModelSlug(model).toLowerCase()
-  return sumActivity(rows, target)
+  const target = baseModelSlug(model).toLowerCase();
+  return sumActivity(rows, target);
 }
 
 function activityNumber(
@@ -151,39 +160,46 @@ function activityNumber(
   rowIndex: number,
   required: boolean,
 ): number {
-  const value = row[field]
+  const value = row[field];
   if (value === undefined || value === null) {
     if (required) {
-      throw new Error(`activity row ${rowIndex} is missing ${field}`)
+      throw new Error(`activity row ${rowIndex} is missing ${field}`);
     }
-    return 0
+    return 0;
   }
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     throw new Error(
       `activity row ${rowIndex} has invalid ${field}: expected a finite non-negative number, got ${JSON.stringify(value)}`,
-    )
+    );
   }
-  return value
+  return value;
 }
 
 export function sumActivity(rows: ActivityRow[], slugMatch: string): ActivityResult {
-  const target = slugMatch.toLowerCase()
-  const result: ActivityResult = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0 }
+  const target = slugMatch.toLowerCase();
+  const result: ActivityResult = {
+    requests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedTokens: 0,
+  };
   for (let index = 0; index < rows.length; index++) {
-    const row = rows[index]
+    const row = rows[index];
     if (!row || typeof row !== "object" || Array.isArray(row)) {
-      throw new Error(`activity row ${index} is not an object`)
+      throw new Error(`activity row ${index} is not an object`);
     }
     if (typeof row.model !== "string") {
-      throw new Error(`activity row ${index} has invalid model: expected a string, got ${JSON.stringify(row.model)}`)
+      throw new Error(
+        `activity row ${index} has invalid model: expected a string, got ${JSON.stringify(row.model)}`,
+      );
     }
-    if (baseModelSlug(row.model).toLowerCase() !== target) continue
-    result.requests += activityNumber(row, "requests", index, true)
-    result.promptTokens += activityNumber(row, "prompt_tokens", index, true)
-    result.completionTokens += activityNumber(row, "completion_tokens", index, true)
-    result.cachedTokens += activityNumber(row, "cached_tokens", index, false)
+    if (baseModelSlug(row.model).toLowerCase() !== target) continue;
+    result.requests += activityNumber(row, "requests", index, true);
+    result.promptTokens += activityNumber(row, "prompt_tokens", index, true);
+    result.completionTokens += activityNumber(row, "completion_tokens", index, true);
+    result.cachedTokens += activityNumber(row, "cached_tokens", index, false);
   }
-  return result
+  return result;
 }
 
 /**
@@ -194,48 +210,48 @@ export function sumActivity(rows: ActivityRow[], slugMatch: string): ActivityRes
  * shares one permaslug, so ties (weird provider names) resolve by frequency.
  */
 export function permaslugFromEndpoints(endpoints: OpenRouterEndpoint[]): string | undefined {
-  const counts = new Map<string, number>()
+  const counts = new Map<string, number>();
   for (const endpoint of endpoints) {
-    const name = endpoint.name ?? ""
-    const separator = name.lastIndexOf("|")
-    if (separator === -1) continue
-    const tail = name.slice(separator + 1).trim()
-    if (!tail || tail.includes("|")) continue
-    counts.set(tail, (counts.get(tail) ?? 0) + 1)
+    const name = endpoint.name ?? "";
+    const separator = name.lastIndexOf("|");
+    if (separator === -1) continue;
+    const tail = name.slice(separator + 1).trim();
+    if (!tail || tail.includes("|")) continue;
+    counts.set(tail, (counts.get(tail) ?? 0) + 1);
   }
-  let best: string | undefined
-  let bestCount = 0
+  let best: string | undefined;
+  let bestCount = 0;
   for (const [tail, count] of counts) {
     if (count > bestCount || (count === bestCount && best !== undefined && tail < best)) {
-      best = tail
-      bestCount = count
+      best = tail;
+      bestCount = count;
     }
   }
-  return best
+  return best;
 }
 
 /** Endpoint identity rows from the frontend stats API (undocumented, stable in practice). */
 interface FrontendEndpoint {
-  id: string
-  tag?: string | null
-  provider_slug?: string | null
-  provider_name?: string | null
+  id: string;
+  tag?: string | null;
+  provider_slug?: string | null;
+  provider_name?: string | null;
 }
 
 /** One day of Tool Call Error Rate: percentages per endpoint id, plus its volume. */
 interface ToolCallErrorRow {
-  y?: Record<string, number>
-  volume?: Record<string, number>
+  y?: Record<string, number>;
+  volume?: Record<string, number>;
 }
 
 function unwrapData(payload: unknown, status: number, context: string): unknown[] {
-  const data = (payload as { data?: unknown } | null)?.data
-  if (Array.isArray(data)) return data
-  if (Array.isArray(payload)) return payload as unknown[]
+  const data = (payload as { data?: unknown } | null)?.data;
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(payload)) return payload as unknown[];
   // Returning [] here would silently turn envelope drift into "no data" and the
   // filter would disappear without a trace. Mirror the activity client: throw so
   // the caller warns with the route and status.
-  throw new OpenRouterError(`unexpected ${context} payload`, status)
+  throw new OpenRouterError(`unexpected ${context} payload`, status);
 }
 
 /**
@@ -253,76 +269,118 @@ export async function fetchToolCallErrorRate(
   permaslug: string,
   options: FetchOptions & { timeRange?: string } = {},
 ): Promise<Map<string, number>> {
-  const fetchImpl = options.fetchImpl ?? fetch
-  const base = options.baseUrl ?? FRONTEND_BASE_URL
-  const signal = requestSignal(options)
-  const timeRange = options.timeRange ?? "1w"
-  const slug = encodeURIComponent(permaslug)
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const base = options.baseUrl ?? FRONTEND_BASE_URL;
+  const signal = requestSignal(options);
+  const timeRange = options.timeRange ?? "1w";
+  const slug = encodeURIComponent(permaslug);
 
   const [perfResponse, rateResponse] = await Promise.all([
-    fetchImpl(`${base}/v1/stats/endpoint?permaslug=${slug}&latencyMetric=latency&perfWorkload=text_generation`, {
-      headers: { accept: "application/json" },
-      signal,
-    }),
+    fetchImpl(
+      `${base}/v1/stats/endpoint?permaslug=${slug}&latencyMetric=latency&perfWorkload=text_generation`,
+      {
+        headers: { accept: "application/json" },
+        signal,
+      },
+    ),
     fetchImpl(`${base}/v1/stats/tool-call-error-rate?permaslug=${slug}&timeRange=${timeRange}`, {
       headers: { accept: "application/json" },
       signal,
     }),
-  ])
+  ]);
   if (!perfResponse.ok) {
-    throw new OpenRouterError(`endpoint stats fetch failed for ${permaslug}: HTTP ${perfResponse.status}`, perfResponse.status)
+    throw new OpenRouterError(
+      `endpoint stats fetch failed for ${permaslug}: HTTP ${perfResponse.status}`,
+      perfResponse.status,
+    );
   }
   if (!rateResponse.ok) {
-    throw new OpenRouterError(`tool call error rate fetch failed for ${permaslug}: HTTP ${rateResponse.status}`, rateResponse.status)
+    throw new OpenRouterError(
+      `tool call error rate fetch failed for ${permaslug}: HTTP ${rateResponse.status}`,
+      rateResponse.status,
+    );
   }
 
-  const idToSlug = new Map<string, string>()
-  for (const entry of unwrapData(await perfResponse.json(), perfResponse.status, `endpoint stats for ${permaslug}`) as FrontendEndpoint[]) {
-    if (!entry || typeof entry.id !== "string") continue
-    const mapped = providerSlug({ tag: entry.tag ?? "", provider_name: entry.provider_name ?? entry.provider_slug ?? "" } as OpenRouterEndpoint)
-    if (mapped) idToSlug.set(entry.id, mapped)
+  const idToSlug = new Map<string, string>();
+  for (const entry of unwrapData(
+    await perfResponse.json(),
+    perfResponse.status,
+    `endpoint stats for ${permaslug}`,
+  ) as FrontendEndpoint[]) {
+    if (!entry || typeof entry.id !== "string") continue;
+    const mapped = providerSlug({
+      tag: entry.tag ?? "",
+      provider_name: entry.provider_name ?? entry.provider_slug ?? "",
+    } as OpenRouterEndpoint);
+    if (mapped) idToSlug.set(entry.id, mapped);
   }
 
   const rows = unwrapData(
     await rateResponse.json(),
     rateResponse.status,
     `tool call error rate for ${permaslug}`,
-  ) as ToolCallErrorRow[]
-  const sums = new Map<string, { weighted: number; volume: number }>()
+  ) as ToolCallErrorRow[];
+  const sums = new Map<string, { weighted: number; volume: number }>();
   for (const row of rows) {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
-      throw new OpenRouterError(`tool call error rate payload for ${permaslug} contains a non-object row`, rateResponse.status)
+      throw new OpenRouterError(
+        `tool call error rate payload for ${permaslug} contains a non-object row`,
+        rateResponse.status,
+      );
     }
-    const ratesByEndpoint = row.y
-    const volumes = row.volume
-    if (ratesByEndpoint !== undefined && (typeof ratesByEndpoint !== "object" || ratesByEndpoint === null || Array.isArray(ratesByEndpoint))) {
-      throw new OpenRouterError(`tool call error rate payload for ${permaslug} has an invalid y map`, rateResponse.status)
+    const ratesByEndpoint = row.y;
+    const volumes = row.volume;
+    if (
+      ratesByEndpoint !== undefined &&
+      (typeof ratesByEndpoint !== "object" ||
+        ratesByEndpoint === null ||
+        Array.isArray(ratesByEndpoint))
+    ) {
+      throw new OpenRouterError(
+        `tool call error rate payload for ${permaslug} has an invalid y map`,
+        rateResponse.status,
+      );
     }
-    if (volumes !== undefined && (typeof volumes !== "object" || volumes === null || Array.isArray(volumes))) {
-      throw new OpenRouterError(`tool call error rate payload for ${permaslug} has an invalid volume map`, rateResponse.status)
+    if (
+      volumes !== undefined &&
+      (typeof volumes !== "object" || volumes === null || Array.isArray(volumes))
+    ) {
+      throw new OpenRouterError(
+        `tool call error rate payload for ${permaslug} has an invalid volume map`,
+        rateResponse.status,
+      );
     }
     for (const [id, rate] of Object.entries(ratesByEndpoint ?? {})) {
-      const target = idToSlug.get(id)
-      if (!target) continue
-      const volume = volumes?.[id]
+      const target = idToSlug.get(id);
+      if (!target) continue;
+      const volume = volumes?.[id];
       // Volume is the daily request count behind the rate; without it the rate
       // cannot be weighted, so a lone unweighted sample must not decide the filter.
-      if (typeof rate !== "number" || !Number.isFinite(rate) || typeof volume !== "number" || volume <= 0) continue
-      const acc = sums.get(target) ?? { weighted: 0, volume: 0 }
-      acc.weighted += rate * volume
-      acc.volume += volume
-      sums.set(target, acc)
+      if (
+        typeof rate !== "number" ||
+        !Number.isFinite(rate) ||
+        typeof volume !== "number" ||
+        volume <= 0
+      )
+        continue;
+      const acc = sums.get(target) ?? { weighted: 0, volume: 0 };
+      acc.weighted += rate * volume;
+      acc.volume += volume;
+      sums.set(target, acc);
     }
   }
 
-  const rates = new Map<string, number>()
+  const rates = new Map<string, number>();
   for (const [target, acc] of sums) {
-    if (acc.volume > 0) rates.set(target, acc.weighted / acc.volume)
+    if (acc.volume > 0) rates.set(target, acc.weighted / acc.volume);
   }
   if (rows.length > 0 && rates.size === 0) {
     // Rows arrived but none could be weighted: id mapping, rate, or volume drift.
     // Treat it as envelope damage instead of returning "no providers filtered".
-    throw new OpenRouterError(`tool call error rate payload for ${permaslug} had rows but no usable rates`, rateResponse.status)
+    throw new OpenRouterError(
+      `tool call error rate payload for ${permaslug} had rows but no usable rates`,
+      rateResponse.status,
+    );
   }
-  return rates
+  return rates;
 }
