@@ -23,12 +23,7 @@ every request, so you always land on one of the cheapest providers that actually
 ```jsonc title="opencode.jsonc"
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "opencode-openrouter-optimizer",
-      "options": { "debug": true }
-    },
-  ],
+  "plugins": ["opencode-openrouter-optimizer"],
 }
 ```
 
