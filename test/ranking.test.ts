@@ -120,9 +120,10 @@ describe("rankProviders", () => {
   })
 
   test("filtered-out providers are only enforced when a survivor keeps the route open", () => {
-    // Every endpoint filtered out: survivors is empty, so only extraIgnore applies
-    // and requests pass through rather than losing every known route.
-    const options = { ...DEFAULT_OPTIONS, extraIgnore: ["zed"] }
+    // Every endpoint filtered out and the floor is off: survivors is empty, so only
+    // extraIgnore applies and requests pass through rather than losing every known
+    // route.
+    const options = { ...DEFAULT_OPTIONS, extraIgnore: ["zed"], keepAtLeastN: 0 }
     const ranking = rankProviders(
       [
         endpoint({ provider_name: "theta", tag: "theta/fp8", uptime_last_30m: 40 }),
@@ -226,6 +227,198 @@ describe("rankProviders", () => {
       expect(ranking.blacklistReasons?.[slug]).not.toBeNull()
       expect((ranking.blacklistReasons?.[slug] ?? []).length).toBeGreaterThan(0)
     }
+  })
+})
+
+describe("keepAtLeastN floor", () => {
+  /** A provider that passes every filter. */
+  const good = (name: string) => endpoint({ provider_name: name, tag: `${name}/fp8` })
+
+  test("keeps the provider that fails least hard when the filters starve the routing", () => {
+    // Every provider fails: uptime 89.9 misses the 90% threshold by a hair, 80 misses
+    // it by 10 points, 10 misses it by 80. The lightest miss stands.
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "near", tag: "near/fp8", uptime_last_30m: 89.9 }),
+        endpoint({ provider_name: "mid", tag: "mid/fp8", uptime_last_30m: 80 }),
+        endpoint({ provider_name: "far", tag: "far/fp8", uptime_last_30m: 10 }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    expect(ranking.survivors).toEqual(["near"])
+    expect(ranking.rescued).toEqual(["near"])
+    // The providers that failed harder stay blacklisted.
+    expect(ranking.blacklist).toEqual(["mid", "far"])
+  })
+
+  test("counts how hard the miss was, not just which check failed", () => {
+    // A 24k context misses the 64k window harder than an 80% uptime misses the 90%
+    // one, so the uptime provider is the better rescue candidate.
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "small", tag: "small/fp8", context_length: 24_000 }),
+        endpoint({ provider_name: "flaky", tag: "flaky/fp8", uptime_last_30m: 80 }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    expect(ranking.rescued).toEqual(["flaky"])
+    expect(ranking.survivors).toEqual(["flaky"])
+  })
+
+  test("rescue candidates are only added until the floor is met", () => {
+    const options = { ...DEFAULT_OPTIONS, keepAtLeastN: 2 }
+    const ranking = rankProviders(
+      [
+        good("alpha"),
+        endpoint({ provider_name: "near", tag: "near/fp8", uptime_last_30m: 89.9 }),
+        endpoint({ provider_name: "mid", tag: "mid/fp8", uptime_last_30m: 80 }),
+        endpoint({ provider_name: "far", tag: "far/fp8", uptime_last_30m: 10 }),
+      ],
+      profile,
+      options,
+    )
+    // alpha passed the filters, near fills the floor, mid and far stay blacklisted.
+    expect(ranking.survivors).toEqual(["alpha", "near"])
+    expect(ranking.rescued).toEqual(["near"])
+    expect(ranking.blacklist).toEqual(["mid", "far"])
+  })
+
+  test("a provider that already stands is never rescued", () => {
+    const ranking = rankProviders(
+      [good("alpha"), endpoint({ provider_name: "near", tag: "near/fp8", uptime_last_30m: 89.9 })],
+      profile,
+      { ...DEFAULT_OPTIONS, keepAtLeastN: 3 },
+    )
+    expect(ranking.rescued).toEqual(["near"])
+    expect(ranking.survivors).toEqual(["alpha", "near"])
+    expect(ranking.blacklist).toEqual([])
+  })
+
+  test("does not rescue anything when the filters left enough providers standing", () => {
+    const ranking = rankProviders([good("alpha"), good("beta")], profile, DEFAULT_OPTIONS)
+    expect(ranking.rescued).toEqual([])
+    expect(ranking.survivors).toEqual(["alpha", "beta"])
+  })
+
+  test("keepAtLeastN=0 disables the fallback", () => {
+    const ranking = rankProviders(
+      [endpoint({ provider_name: "near", tag: "near/fp8", uptime_last_30m: 89.9 })],
+      profile,
+      { ...DEFAULT_OPTIONS, keepAtLeastN: 0 },
+    )
+    expect(ranking.rescued).toEqual([])
+    expect(ranking.survivors).toEqual([])
+    expect(ranking.blacklist).toEqual([])
+  })
+
+  test("a provider whose best alias is dead, unpriceable or tool-less is never rescued", () => {
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "dead", tag: "dead/fp8", status: 500 }),
+        endpoint({ provider_name: "unpriced", tag: "unpriced/fp8", pricing: { prompt: "", completion: "" } }),
+        endpoint({ provider_name: "notools", tag: "notools/fp8", supported_parameters: ["response_format"] }),
+        endpoint({ provider_name: "flaky", tag: "flaky/fp8", uptime_last_30m: 89.9 }),
+      ],
+      profile,
+      { ...DEFAULT_OPTIONS, keepAtLeastN: 3 },
+    )
+    // Only the flaky provider has an alias that could still work.
+    expect(ranking.rescued).toEqual(["flaky"])
+    expect(ranking.survivors).toEqual(["flaky"])
+    expect(ranking.blacklist).toEqual(["dead", "unpriced", "notools"])
+  })
+
+  test("the best alias of a provider decides whether it can be rescued", () => {
+    // One alias is dead, the other one only misses the uptime threshold: the best
+    // alias decides, and the provider can stand.
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "mixed", tag: "mixed/dead", status: 500 }),
+        endpoint({ provider_name: "mixed", tag: "mixed/flaky", uptime_last_30m: 89.9 }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    expect(ranking.rescued).toEqual(["mixed"])
+    expect(ranking.survivors).toEqual(["mixed"])
+  })
+
+  test("a provider whose every alias is dead is never rescued", () => {
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "dead", tag: "dead/one", status: 500 }),
+        endpoint({ provider_name: "dead", tag: "dead/two", status: 503 }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    expect(ranking.rescued).toEqual([])
+    expect(ranking.survivors).toEqual([])
+    expect(ranking.blacklist).toEqual([])
+  })
+
+  test("a provider blocked by extraIgnore is never rescued", () => {
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "near", tag: "near/fp8", uptime_last_30m: 89.9 }),
+        endpoint({ provider_name: "mid", tag: "mid/fp8", uptime_last_30m: 80 }),
+      ],
+      profile,
+      { ...DEFAULT_OPTIONS, keepAtLeastN: 2, extraIgnore: ["near"] },
+    )
+    expect(ranking.rescued).toEqual(["mid"])
+    expect(ranking.survivors).toEqual(["mid"])
+    expect(ranking.blacklist).toEqual(["near"])
+  })
+
+  test("in free mode only a free provider is rescued", () => {
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "freegood", tag: "freegood/fp8", pricing: { prompt: "0", completion: "0" } }),
+        endpoint({
+          provider_name: "freeflaky",
+          tag: "freeflaky/fp8",
+          pricing: { prompt: "0", completion: "0" },
+          uptime_last_30m: 89.9,
+        }),
+        endpoint({
+          provider_name: "paidflaky",
+          tag: "paidflaky/fp8",
+          pricing: { prompt: "0.0000001", completion: "0.0000002" },
+          uptime_last_30m: 89.9,
+        }),
+      ],
+      profile,
+      { ...DEFAULT_OPTIONS, keepAtLeastN: 2 },
+    )
+    expect(ranking.mode).toBe("free")
+    expect(ranking.survivors).toEqual(["freegood", "freeflaky"])
+    expect(ranking.rescued).toEqual(["freeflaky"])
+    expect(ranking.blacklist).toEqual(["paidflaky"])
+  })
+
+  test("the rescued provider is marked with the checks it failed", () => {
+    const ranking = rankProviders(
+      [endpoint({ provider_name: "flaky", tag: "flaky/fp8", uptime_last_30m: 89.9 })],
+      profile,
+      DEFAULT_OPTIONS,
+    )
+    const entry = ranking.rankings.find((rank) => rank.slug === "flaky")
+    expect(entry?.rescued).toBe(true)
+    expect(entry?.failedReasons).toEqual(["uptime"])
+  })
+
+  test("the standing count stops at keepAtLeastN", () => {
+    const many = ["n1", "n2", "n3", "n4"].map((name) =>
+      endpoint({ provider_name: name, tag: `${name}/fp8`, uptime_last_30m: 89.9 }),
+    )
+    const ranking = rankProviders(many, profile, { ...DEFAULT_OPTIONS, keepAtLeastN: 2 })
+    expect(ranking.survivors).toHaveLength(2)
+    // The two least-bad misses stand; the others stay blacklisted.
+    expect(ranking.rescued).toHaveLength(2)
+    expect(ranking.blacklist).toHaveLength(2)
   })
 })
 

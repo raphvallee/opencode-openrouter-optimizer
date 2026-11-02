@@ -41,6 +41,88 @@ export interface Filtered {
 }
 
 /**
+ * Relative weight of every filter failure: how badly it breaks a session.
+ *
+ * The numbers only have to order the rescue candidates, so they encode "how much
+ * does a session suffer from this", not a cost model. Each failed check adds its
+ * weight scaled by how far past the threshold it is (see failureMagnitude), so a
+ * provider that misses a threshold by a hair always beats one that misses it
+ * badly.
+ *
+ * - status: the endpoint is not serving at all.
+ * - tools: the model cannot call tools, so the session cannot work.
+ * - pricing: the cost cannot be verified, so the route cannot be ranked.
+ * - context: the session dies once the conversation outgrows the window.
+ * - tool-errors: invalid tool calls break the agent loop.
+ * - uptime: the provider drops requests outright.
+ * - completion: answers get cut short, but the request still succeeds.
+ */
+const FAILURE_WEIGHTS: Record<string, number> = {
+  status: 1000,
+  tools: 500,
+  pricing: 400,
+  context: 40,
+  "tool-errors": 30,
+  uptime: 20,
+  completion: 10,
+}
+
+/**
+ * How far past its threshold a failure is, as a 0..1 ratio: the share of the
+ * requirement that is missing. A provider at 89.9% uptime (min 90) misses 0.1%
+ * of what was asked for, one at 40% misses 55%.
+ */
+function failureMagnitude(
+  endpoint: OpenRouterEndpoint,
+  reason: string,
+  options: OptimizerOptions,
+): number {
+  const ratio = (missing: number, span: number): number =>
+    Math.min(1, Math.max(0, missing / Math.max(span, 1)))
+  switch (reason) {
+    case "uptime": {
+      const uptime = endpoint.uptime_last_30m ?? endpoint.uptime_last_1d ?? 100
+      return ratio(options.minUptimePercent - uptime, options.minUptimePercent)
+    }
+    case "tool-errors": {
+      // The cap is a maximum, so the miss is measured against the headroom that
+      // was left above it: twice the cap eats half of the remaining band.
+      const rate = endpoint.toolCallErrorRate ?? 0
+      return ratio(rate - options.maxToolCallErrorRate, 100 - options.maxToolCallErrorRate)
+    }
+    case "context": {
+      const length = endpoint.context_length ?? 0
+      return ratio(options.minContextLength - length, options.minContextLength)
+    }
+    case "completion": {
+      const max = endpoint.max_completion_tokens ?? 0
+      return ratio(options.minMaxCompletionTokens - max, options.minMaxCompletionTokens)
+    }
+    default:
+      return 1
+  }
+}
+
+/**
+ * How badly an endpoint failed the filters: lower is better ("fails least
+ * hard"). Every failed check contributes its weight scaled by how far past the
+ * threshold it is, so a provider at 89.9% uptime (min 90) is a far better
+ * rescue candidate than one at 40%.
+ */
+export function filterSeverity(
+  endpoint: OpenRouterEndpoint,
+  reasons: string[],
+  options: OptimizerOptions,
+): number {
+  let severity = 0
+  for (const reason of reasons) {
+    const weight = FAILURE_WEIGHTS[reason] ?? 20
+    severity += weight * failureMagnitude(endpoint, reason, options)
+  }
+  return severity
+}
+
+/**
  * Drop endpoints that would break OpenCode sessions, be cursed for quality, or have unknown
  * pricing. Returns every failed check (not just the first) so the debug print can show the
  * full diagnosis; an empty array means the endpoint passed all filters.
@@ -75,6 +157,13 @@ export interface ProviderRank {
   perRequest: number
   total: number
   rank: number
+  /**
+   * True when the provider failed the endpoint filters and was kept anyway,
+   * because keepAtLeastN needed more providers to stand.
+   */
+  rescued?: boolean
+  /** The filter checks this provider failed (rescued providers only). */
+  failedReasons?: string[]
 }
 
 export type RankingMode = "free" | "cheapest"
@@ -90,8 +179,31 @@ export interface Ranking {
    * later works immediately instead of showing nothing until the next re-rank.
    */
   blacklistReasons?: Record<string, string[]>
+  /**
+   * Providers that failed the endpoint filters but stood anyway, because
+   * keepAtLeastN needed more providers to stand than the filters left. Empty when
+   * the filters left enough providers on their own.
+   */
+  rescued: string[]
   profile: RequestProfile
   computedAt: number
+}
+
+/**
+ * Filter failures that disqualify a provider from the keepAtLeastN floor.
+ *
+ * - status: the endpoint is not serving; the route is dead right now.
+ * - pricing: the price cannot be parsed, so the route cannot be cost-ranked.
+ *   The plugin never routes to a provider whose cost it cannot verify.
+ * - tools: the model cannot call tools, so the session cannot work at all.
+ */
+const UNRESCUABLE_REASONS = new Set(["status", "pricing", "tools"])
+
+/** One failed endpoint: the checks it missed and how badly it missed them. */
+interface Failure {
+  endpoint: OpenRouterEndpoint
+  reasons: string[]
+  severity: number
 }
 
 /**
@@ -109,6 +221,16 @@ export interface Ranking {
  * would steer OpenRouter straight to the cheap-but-broken providers the filters
  * excluded. Enforcement requires at least one known-good route: when no endpoint
  * survives, only the user's extraIgnore is applied and the request passes through.
+ *
+ * keepAtLeastN is the floor on the providers that stay standing. The filters can
+ * be strict enough to leave none, and then the request would go out unrouted, to a
+ * provider nobody vetted. The floor stops the filtering early instead: the
+ * providers that fail least hard stand as well, and the ones that failed harder
+ * stay blacklisted. The count of standing providers stops at keepAtLeastN, so
+ * only the providers that missed the thresholds by the least are let through.
+ * A provider whose best alias is dead, unpriceable or
+ * tool-less is never rescued: the routing block ignores providers, not aliases,
+ * so it would put the broken alias back on the route.
  */
 export function rankProviders(
   endpoints: OpenRouterEndpoint[],
@@ -130,6 +252,13 @@ export function rankProviders(
   //    Filtered slugs are remembered: they are known providers and enforceable.
   const eligible: Array<{ endpoint: OpenRouterEndpoint; slug: string }> = []
   const filteredSlugs = new Set<string>()
+  // Slugs with at least one endpoint that passed every filter. They stand on their
+  // own and never need rescuing.
+  const qualified = new Set<string>()
+  // slug -> its failing endpoints, with the reasons and how hard each one failed.
+  // The rescue picks the least-bad alias of a provider, so every failed alias has
+  // to be kept until the mode is known (in free mode only a free alias may stand).
+  const failing = new Map<string, Failure[]>()
   for (const endpoint of endpoints) {
     const slug = providerSlug(endpoint)
     if (!slug) continue
@@ -137,8 +266,17 @@ export function rankProviders(
     if (filterReasons.length > 0) {
       filteredSlugs.add(slug)
       for (const filterReason of filterReasons) addReason(slug, filterReason)
+      const failure: Failure = {
+        endpoint,
+        reasons: filterReasons,
+        severity: filterSeverity(endpoint, filterReasons, options),
+      }
+      const list = failing.get(slug)
+      if (list) list.push(failure)
+      else failing.set(slug, [failure])
       continue
     }
+    qualified.add(slug)
     eligible.push({ endpoint, slug })
   }
 
@@ -171,17 +309,95 @@ export function rankProviders(
   const ordered = [...bySlug.values()].sort(
     (a, b) => a.perRequest - b.perRequest || (a.slug < b.slug ? -1 : 1),
   )
-  ordered.forEach((entry, index) => (entry.rank = index + 1))
 
-  const survivors = freeMode
-    ? ordered.map((entry) => entry.slug)
-    : ordered.slice(0, options.topN).map((entry) => entry.slug)
+  // 4) keepAtLeastN floor. The filters can starve the routing: a model whose
+  //    providers all miss a threshold (a 24k context, a flaky uptime) leaves no
+  //    provider standing, and the request then goes out unrouted, to a provider
+  //    nobody vetted. The floor stops the filtering early: the providers that fail
+  //    least hard stand as well, and the ones that failed harder stay blacklisted.
+  //
+  //    Which ones: the providers the filters removed, ordered by how little they
+  //    failed - the lightest miss first (a provider at 89.9% uptime misses less
+  //    than one at 40%), then the fewest failed checks, then the cheapest, then
+  //    the slug so the order is stable. Providers that already stand are never
+  //    rescued, and in free mode only a free provider qualifies, so the mode's
+  //    promise survives.
+  const rescued: string[] = []
+  const rescuedRanks: ProviderRank[] = []
+  // The providers that stand on their own: the cheapest ones in cheapest mode
+  // (topN caps them, keepAtLeastN raises the cap so enough good providers can
+  // hold the floor), every free one in free mode (topN is ignored there).
+  const standing = freeMode
+    ? ordered
+    : ordered.slice(0, Math.max(options.topN, options.keepAtLeastN))
+  // How many providers the floor still misses. The floor only ever adds
+  // providers: the count stops at keepAtLeastN, so the providers that failed
+  // harder than the rescued ones stay blacklisted.
+  const deficit = Math.max(0, options.keepAtLeastN - standing.length)
+  if (deficit > 0) {
+    const extraIgnore = new Set(options.extraIgnore)
+    const candidates: Array<{ slug: string; failure: Failure }> = []
+    for (const [slug, failures] of failing) {
+      // A provider that already stands on its own never needs rescuing.
+      if (qualified.has(slug)) continue
+      // The user excluded it explicitly.
+      if (extraIgnore.has(slug)) continue
+      // In free mode only a free alias may stand: a paid provider would break
+      // the mode's promise.
+      const pool = freeMode
+        ? failures.filter((failure) => isFreePricing(failure.endpoint.pricing, profile.avgInput))
+        : failures
+      if (pool.length === 0) continue
+      // The alias a rescue would put on the routing: the one that fails least hard.
+      const best = pool.reduce((a, b) => (b.severity < a.severity ? b : a))
+      // A provider whose best alias is dead, unpriceable or tool-less is never
+      // rescued: the routing block ignores providers, not aliases, so it would
+      // put the broken alias back on the route.
+      if (best.reasons.some((reason) => UNRESCUABLE_REASONS.has(reason))) continue
+      candidates.push({ slug, failure: best })
+    }
+    candidates.sort((a, b) => {
+      if (a.failure.severity !== b.failure.severity) return a.failure.severity - b.failure.severity
+      if (a.failure.reasons.length !== b.failure.reasons.length) {
+        return a.failure.reasons.length - b.failure.reasons.length
+      }
+      const cost =
+        requestCost(a.failure.endpoint.pricing, profile).perRequest -
+        requestCost(b.failure.endpoint.pricing, profile).perRequest
+      if (cost !== 0) return cost
+      return a.slug < b.slug ? -1 : 1
+    })
+    for (const { slug, failure } of candidates.slice(0, deficit)) {
+      const { perRequest } = requestCost(failure.endpoint.pricing, profile)
+      const uptime = failure.endpoint.uptime_last_30m ?? failure.endpoint.uptime_last_1d ?? 100
+      rescued.push(slug)
+      rescuedRanks.push({
+        slug,
+        endpoint: failure.endpoint,
+        slugUptime: uptime,
+        perRequest,
+        total: totalCost(perRequest, profile.numRequests),
+        rank: 0,
+        rescued: true,
+        failedReasons: failure.reasons,
+      })
+    }
+  }
+
+  // The full ranking: every provider that passed the filters, by price, then the
+  // rescued ones. The rescued ones come last because they failed a check and are
+  // only there to hold the floor.
+  const rankings = [...ordered, ...rescuedRanks]
+  rankings.forEach((entry, index) => (entry.rank = index + 1))
+  // The providers that stay routable: the ones that passed every filter (the
+  // cheapest of them, capped by topN) plus the rescued ones.
+  const survivors = [...standing.map((entry) => entry.slug), ...rescued]
+  const survivorSet = new Set(survivors)
 
   // In free mode the paid eligible slugs all go into the blacklist; in cheapest mode
   // it holds every ranked-but-not-surviving slug. Filtered-out slugs are enforceable
   // (known providers) but only when at least one survivor keeps the route open.
   // extraIgnore always applies: it is the user's explicit instruction.
-  const survivorSet = new Set(survivors)
   const blacklist = survivors.length === 0
     ? [...new Set(options.extraIgnore)]
     : [
@@ -211,10 +427,11 @@ export function rankProviders(
 
   return {
     mode: freeMode ? "free" : "cheapest",
-    rankings: ordered,
+    rankings,
     survivors,
     blacklist,
     blacklistReasons,
+    rescued,
     profile,
     computedAt: now,
   }

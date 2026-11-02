@@ -853,6 +853,68 @@ describe("hot path", () => {
     }
   }, 10_000)
 
+  test("providers rescued by the floor are warned about and still routed", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
+    delete process.env.OPENROUTER_MANAGEMENT_KEY
+    const savedFetch = globalThis.fetch
+    // Every provider fails the uptime filter: alpha misses it by 10 points, beta by
+    // 40. The floor keeps the one that fails least hard.
+    const rescuedPayload = {
+      data: {
+        id: "vendor/model",
+        name: "Vendor Model",
+        endpoints: [
+          { name: "A | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000001", completion: "0.0000002" }, provider_name: "A", tag: "alpha/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 80 },
+          { name: "B | m", model_id: "vendor/model", context_length: 128_000, max_completion_tokens: 32_768, max_prompt_tokens: null, pricing: { prompt: "0.0000002", completion: "0.0000003" }, provider_name: "B", tag: "beta/fp8", supported_parameters: ["tools", "tool_choice"], status: 0, uptime_last_30m: 50 },
+        ],
+      },
+    }
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === ENDPOINTS_URL) return Promise.resolve(new Response(JSON.stringify(rescuedPayload), { status: 200 }))
+      return savedFetch.bind(globalThis)(input as never, init)
+    }) as typeof fetch
+
+    const warnings: string[] = []
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    })
+
+    try {
+      const { ctx, hooks } = makeCtx({})
+      const plugin = definePlugin({
+        dbPath: ":memory:",
+        statsRun: async () => JSON.stringify({ models: [] }),
+        // The optional probe would only add noise to the warnings.
+        maxToolCallErrorRate: 100,
+      } as never)
+      const cleanup = await plugin.setup!(ctx as never)
+      try {
+        const handler = hooks.get("http.request")!.handler
+        const evt = { request: openRouterRequest(), model: { providerID: "openrouter" }, kind: "primary" }
+        await handler(evt)
+
+        // The user has to know that a provider which failed the filters is used.
+        const notice = warnings.find((line) => line.includes("left too few providers standing"))
+        expect(notice).toBeDefined()
+        expect(notice).toContain("alpha (uptime)")
+        // Only the provider that fails least hard stands; the other stays blocked.
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { ignore?: string[]; sort?: string }
+        }
+        expect(parsed.provider?.ignore).toEqual(["beta"])
+        expect(parsed.provider?.sort).toBe("price")
+      } finally {
+        spy.mockRestore()
+        await cleanup?.()
+      }
+    } finally {
+      globalThis.fetch = savedFetch
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv
+    }
+  }, 10_000)
+
   test("an unrecognized activity envelope degrades loudly and still routes", async () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY
     process.env.OPENROUTER_MANAGEMENT_KEY = "test-key"

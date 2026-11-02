@@ -11,6 +11,7 @@ describe("resolveOptions", () => {
     const options = resolveOptions({
       ttlHours: "12",
       topN: 4,
+      keepAtLeastN: "2",
       minContextLength: 128_000,
       maxToolCallErrorRate: 5,
       injectSort: false,
@@ -26,6 +27,7 @@ describe("resolveOptions", () => {
     })
     expect(options.ttlHours).toBe(12)
     expect(options.topN).toBe(4)
+    expect(options.keepAtLeastN).toBe(2)
     expect(options.minContextLength).toBe(128_000)
     expect(options.maxToolCallErrorRate).toBe(5)
     expect(options.injectSort).toBe(false)
@@ -56,9 +58,17 @@ describe("resolveOptions", () => {
     expect(() => resolveOptions({ ttlHours: "6 hours" })).toThrow(/option "ttlHours" must be a finite number/)
     expect(() => resolveOptions({ topN: 0 })).toThrow(/option "topN" must be >= 1/)
     expect(() => resolveOptions({ topN: 2.5 })).toThrow(/option "topN" must be an integer/)
+    expect(() => resolveOptions({ keepAtLeastN: -1 })).toThrow(/option "keepAtLeastN" must be >= 0/)
+    expect(() => resolveOptions({ keepAtLeastN: 1.5 })).toThrow(/option "keepAtLeastN" must be an integer/)
     expect(() => resolveOptions({ minUptimePercent: 101 })).toThrow(/option "minUptimePercent" must be <= 100/)
     expect(() => resolveOptions({ maxToolCallErrorRate: -1 })).toThrow(/option "maxToolCallErrorRate" must be >= 0/)
     expect(() => resolveOptions({ fallbackCacheHitRate: 2 })).toThrow(/option "fallbackCacheHitRate" must be <= 1/)
+  })
+
+  test("keepAtLeastN defaults to 1 and accepts 0 to disable the fallback", () => {
+    expect(DEFAULT_OPTIONS.keepAtLeastN).toBe(1)
+    expect(resolveOptions({}).keepAtLeastN).toBe(1)
+    expect(resolveOptions({ keepAtLeastN: 0 }).keepAtLeastN).toBe(0)
   })
 
   test("rejects non-array and non-string extraIgnore entries", () => {

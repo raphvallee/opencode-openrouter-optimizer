@@ -11,7 +11,9 @@ OpenCode v2 plugin (Bun + TypeScript) that keeps OpenRouter routing cheap:
   OpenCode's own usage stats (`opencode stats --json --models --days 30`, run only in
   the background refresh task with a cached single-flight snapshot), ranks providers,
   keeps the 3 cheapest and blacklists the rest by injecting `provider.ignore`
-  (plus `provider.sort: "price"`) into every request.
+  (plus `provider.sort: "price"`) into every request. When the endpoint filters would
+  leave too few providers standing, the `keepAtLeastN` floor keeps the providers that
+  fail least hard instead of routing nothing.
 - A model seen for the first time waits for its ranking before the request is sent, so the
   first prompt already goes to the provider the session will keep using. Switching after
   the fact would pay a cache-write charge twice on providers that bill for cache writes.
@@ -42,9 +44,30 @@ cheap-but-broken endpoint. An endpoint whose required prices cannot be parsed (`
 present but unparseable cache-write price: the endpoint is blacklisted rather than billing
 the cache write as $0. An unparseable cache-read price is treated as "no cache": cached
 input is billed at the prompt rate instead of receiving a cache discount. When no endpoint
-passes the filters, the plugin passes requests through (only `extraIgnore` is enforced)
-rather than blocking every known route; `provider.sort` is only injected when at least one
-survivor exists.
+passes the filters, the `keepAtLeastN` floor takes over (see below); only when even that
+leaves nothing standing does the plugin pass requests through (only `extraIgnore` is
+enforced) rather than blocking every known route. `provider.sort` is only injected when at
+least one survivor exists.
+
+### The keepAtLeastN floor
+
+The endpoint filters can be strict enough to leave no provider standing: a model whose
+providers all have a 24k context, or all run below 90% uptime. The request would then go
+out unrouted, to a provider nobody vetted. `keepAtLeastN` (default `1`) is the floor that
+prevents that: the filtering stops early and the providers that fail least hard stand
+instead of giving up.
+
+Which ones stand is decided by how badly a provider failed, not by which check it failed.
+Every failed check adds its weight scaled by how far past the threshold it is (a dead
+endpoint and a model without tool support weigh the most, uptime and completion caps the
+least), so a provider at 89.9% uptime is a far better rescue candidate than one at 40%.
+The count of standing providers stops at `keepAtLeastN`: the providers that failed harder
+stay blacklisted. A provider whose best alias is dead, unpriceable or tool-less is never
+rescued (the routing block ignores providers, not aliases, so it would put the broken
+alias back on the route), and in free mode only a free provider can be rescued. The
+rescued providers are named in a warning, so a relaxed filter is never silent. Set
+`keepAtLeastN: 0` to turn the fallback off: a starved model then passes its requests
+through unrouted, as before.
 
 ### Context-tiered pricing
 
@@ -130,7 +153,8 @@ usage and the fallback profile until real data accumulates.
 A request the plugin cannot route is sent unfiltered, which can cost real money. The
 plugin refuses to let that happen silently: it writes a `Routing failure` message into
 the session transcript naming the model and the reason (no ranking available, no
-endpoint passed the filters, non-JSON body, routing error), once per session/model/reason.
+endpoint passed the filters and none could be kept by the `keepAtLeastN` floor, non-JSON
+body, routing error), once per session/model/reason.
 
 The package also ships a TUI part at the `./tui` export that raises an error toast for
 each of those messages, so the failure is visible even when you are not reading the
@@ -162,6 +186,7 @@ registers nothing, so no toasts are raised while the server routing keeps runnin
 | --- | --- | --- |
 | `ttlHours` | `6` | Prices/refresh staleness window |
 | `topN` | `3` | Cheapest providers allowed through |
+| `keepAtLeastN` | `1` | Floor on the providers that stay routable: when the filters starve the routing, the providers that fail least hard are kept instead of letting the request go out unrouted; `0` disables the fallback |
 | `minContextLength` | `64000` | Endpoint context filter |
 | `minMaxCompletionTokens` | `8000` | Endpoint output-cap filter (3072-token style providers are excluded) |
 | `minUptimePercent` | `90` | Endpoint uptime filter |
@@ -193,6 +218,7 @@ granularly (you normally never need to set any of these):
       "options": {
         "ttlHours": 6,
         "topN": 3,
+        "keepAtLeastN": 1,
         "minContextLength": 64000,
         "minMaxCompletionTokens": 8000,
         "minUptimePercent": 90,

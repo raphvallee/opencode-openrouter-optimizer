@@ -145,6 +145,10 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
 			// through unrouted, which must not be invisible.
 			const unroutedWarned = new Set<string>();
 
+			// One-time notice per model: the keepAtLeastN floor relaxed the filters, so
+			// providers that failed them are being routed to. That must not be invisible.
+			const rescueWarned = new Set<string>();
+
 			// One-time notices per session/model for requests that could not be routed and
 			// went out unfiltered. Synthetic messages make the failure visible in the TUI.
 			const notifiedFailures = new Set<string>();
@@ -425,12 +429,34 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
 								`${model}: no endpoint passed the filters, requests pass through unrouted`,
 							);
 						}
+					} else if (ranking.rescued.length > 0 && !rescueWarned.has(model)) {
+						// The floor kept providers that failed the filters, so the requests now
+						// go to providers the filters rejected. Say which ones and why.
+						rescueWarned.add(model);
+						const details = ranking.rescued
+							.map((slug) => {
+								const failed =
+									ranking.rankings.find((entry) => entry.slug === slug)
+										?.failedReasons ?? [];
+								return failed.length > 0
+									? `${slug} (${failed.join(", ")})`
+									: slug;
+							})
+							.join(", ");
+						warn(
+							`${model}: the filters left too few providers standing, so ${ranking.rescued.length} provider(s) that failed them are used anyway: ${details}`,
+						);
 					}
 
-					debug(
+					const debugParts = [
 						`ranked ${model} (${routing.mode}): top ${routing.survivors.length} = [${routing.survivors.join(", ")}]`,
 						`blacklist size ${routing.blacklist.length}`,
-					);
+					];
+					if (ranking.rescued.length > 0)
+						debugParts.push(
+							`rescued (failed the filters): [${ranking.rescued.join(", ")}]`,
+						);
+					debug(...debugParts);
 				} catch (error) {
 					// A shutdown abort cancels the refresh; it is not a refresh failure and the
 					// DB may already be closing, so skip failure bookkeeping entirely.
@@ -588,10 +614,15 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
 				const selected = details
 					? details
 							.filter((entry) => entry && allowed.has(entry.slug))
-							.map(
-								(entry) =>
-									`${entry.slug} ($${Number(entry.perRequest ?? 0).toFixed(6)})`,
-							)
+							.map((entry) => {
+								const price = `$${Number(entry.perRequest ?? 0).toFixed(6)}`;
+								// A rescued provider stands although it failed the filters: say so.
+								if (!entry.rescued) return `${entry.slug} (${price})`;
+								const failed = entry.failedReasons ?? [];
+								return failed.length > 0
+									? `${entry.slug} (${price}, rescued: failed ${failed.join(", ")})`
+									: `${entry.slug} (${price}, rescued)`;
+							})
 					: routing.survivors;
 				debug(
 					`routing ${model} (${routing.mode ?? "cheapest"}): keeping ${selected.length} = [${selected.join(", ")}]`,

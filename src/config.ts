@@ -5,6 +5,13 @@ export interface OptimizerOptions {
   ttlHours: number
   /** Number of cheapest providers allowed through. */
   topN: number
+  /**
+   * Minimum number of providers that must stay routable after the endpoint
+   * filters. When the filters would leave fewer survivors than this, the
+   * least-bad failures are kept instead of the request going out unrouted.
+   * 0 disables the fallback (nothing is rescued).
+   */
+  keepAtLeastN: number
   /** Endpoint filters. */
   minContextLength: number
   minMaxCompletionTokens: number
@@ -69,6 +76,7 @@ export interface OptimizerOptions {
 export const DEFAULT_OPTIONS: OptimizerOptions = {
   ttlHours: 6,
   topN: 3,
+  keepAtLeastN: 1,
   minContextLength: 64_000,
   minMaxCompletionTokens: 8_000,
   minUptimePercent: 90,
@@ -95,6 +103,7 @@ export const DEFAULT_OPTIONS: OptimizerOptions = {
 const OPTION_KEYS: ReadonlyArray<keyof OptimizerOptions> = [
   "ttlHours",
   "topN",
+  "keepAtLeastN",
   "minContextLength",
   "minMaxCompletionTokens",
   "minUptimePercent",
@@ -247,6 +256,7 @@ export function resolveOptions(input?: unknown): OptimizerOptions {
   return {
     ttlHours: numberOption(raw, "ttlHours", DEFAULT_OPTIONS.ttlHours, { min: 0 }),
     topN: numberOption(raw, "topN", DEFAULT_OPTIONS.topN, { min: 1, integer: true }),
+    keepAtLeastN: numberOption(raw, "keepAtLeastN", DEFAULT_OPTIONS.keepAtLeastN, { min: 0, integer: true }),
     minContextLength: numberOption(raw, "minContextLength", DEFAULT_OPTIONS.minContextLength, { min: 0, integer: true }),
     minMaxCompletionTokens: numberOption(raw, "minMaxCompletionTokens", DEFAULT_OPTIONS.minMaxCompletionTokens, {
       min: 0,
