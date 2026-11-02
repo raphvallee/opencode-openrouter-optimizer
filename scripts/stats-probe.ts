@@ -1,4 +1,4 @@
-import { OpenCodeStats, pickProfile } from "../src/stats";
+import { OpenCodeStats, pickProfile } from "../src/stats.js";
 
 const stats = new OpenCodeStats({ ttlMs: 60_000, log: (m) => console.log("log:", m) });
 const t0 = performance.now();

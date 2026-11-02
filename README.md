@@ -1,5 +1,9 @@
 # opencode-openrouter-optimizer
 
+[![npm](https://img.shields.io/npm/v/opencode-openrouter-optimizer.svg)](https://www.npmjs.com/package/opencode-openrouter-optimizer)
+[![CI](https://github.com/raphvallee/opencode-openrouter-optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/raphvallee/opencode-openrouter-optimizer/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/opencode-openrouter-optimizer.svg)](./LICENSE)
+
 An OpenCode v2 plugin (Bun + TypeScript) that keeps OpenRouter routing cheap. It ranks
 OpenRouter providers by expected cost and injects a per-request provider blacklist into
 every request, so you always land on one of the cheapest providers that actually works.
@@ -12,13 +16,26 @@ every request, so you always land on one of the cheapest providers that actually
 - Keeps the cheapest providers routable and blacklists the rest by injecting
   `provider.ignore` (plus `provider.sort: "price"`) into each request.
 - Merges real usage data from OpenRouter Activity (when you provide a management key)
-  and OpenCode's own stats, so ranking reflects how *you* actually use each model.
+  and OpenCode's own stats, so ranking reflects how _you_ actually use each model.
 - Fails open: a request it cannot route goes out unmodified, with a `Routing failure`
   message in the transcript and an error toast in the TUI, so you always know why.
 
-## Quick start
+## Requirements
 
-1. Add the plugin to `opencode.jsonc`:
+- OpenCode v2 (the plugin uses the v2 plugin API).
+- Bun. The plugin reads its state from `bun:sqlite`, and OpenCode itself runs on Bun.
+
+## Install
+
+The plugin is published on npm as `opencode-openrouter-optimizer`. Install it with the
+OpenCode CLI:
+
+```sh
+opencode plugin add opencode-openrouter-optimizer
+```
+
+That installs the package and adds it to your OpenCode configuration. The result is
+equivalent to adding the package name to `opencode.jsonc` yourself:
 
 ```jsonc title="opencode.jsonc"
 {
@@ -27,13 +44,20 @@ every request, so you always land on one of the cheapest providers that actually
 }
 ```
 
-2. Restart OpenCode. That's it. The defaults work out of the box: the plugin ranks
-   providers by cost, keeps the 3 cheapest that pass its quality filters, and blocks
-   the rest.
+Restart OpenCode afterwards. That is it. The defaults work out of the box: the plugin ranks
+providers by cost, keeps the 3 cheapest that pass its quality filters, and blocks the rest.
 
-3. Optional, but recommended: export an OpenRouter **management** key (Settings >
-   Management Keys on openrouter.ai - not an inference key) so ranking can use 30 days
-   of your real account activity:
+You can also install it manually with any package manager, for example:
+
+```sh
+npm install opencode-openrouter-optimizer
+```
+
+## Configuration
+
+Optionally, but recommended: export an OpenRouter **management** key (Settings >
+Management Keys on openrouter.ai, not an inference key) so ranking can use 30 days of your
+real account activity:
 
 ```sh
 export OPENROUTER_MANAGEMENT_KEY=sk-mgmt-...
@@ -42,44 +66,7 @@ export OPENROUTER_MANAGEMENT_KEY=sk-mgmt-...
 Without it, ranking uses OpenCode-side usage and a fallback profile until real data
 accumulates.
 
-A local clone can be loaded the same way, by path:
-
-```jsonc title="opencode.jsonc"
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "D:/t3-projects/opencode-openrouter-optimizer",
-      "options": { "debug": true }
-    },
-  ],
-}
-```
-
-## How routing works
-
-For every OpenRouter model, the plugin filters endpoints by quality (context window,
-completion cap, uptime, tool-call support and error rate), ranks the survivors by
-expected cost, and lets only the cheapest few through. Three behaviors matter to know:
-
-- **Cheapest-first routing**: the `topN` cheapest survivors (default 3) stay routable
-  and `provider.sort: "price"` tells OpenRouter to prefer the cheapest of those.
-- **Free mode**: when any surviving provider serves the model at $0, every free provider
-  stays routable (the top-3 cap does not apply to them) and all paid providers are
-  blacklisted. Free status is judged at your workload's context length, so a tier that
-  prices long contexts does not sneak in.
-- **The rescue floor**: if the quality filters would starve the routing (e.g. only 1
-  endpoint exists, or all fail context/uptime checks), the `keepAtLeastN` floor keeps
-  the least-bad providers instead of sending the request unrouted. `0` disables the
-  floor; the default `1` guarantees at least one provider stands.
-
-The first request for a new model waits (up to `rankingWaitMs`, default 15s) for its
-ranking, so the session starts on the provider it will keep using and does not pay a
-cache-write charge twice. Refreshes run in the background and apply to the next request.
-
-## Configuration
-
-You normally never need to set any option - defaults are sane. Common tweaks:
+You normally never need to set any option, the defaults are sane. Common tweaks:
 
 ```jsonc title="opencode.jsonc"
 {
@@ -87,11 +74,11 @@ You normally never need to set any option - defaults are sane. Common tweaks:
     {
       "package": "opencode-openrouter-optimizer",
       "options": {
-        "topN": 3,              // how many cheapest providers stay routable
-        "keepAtLeastN": 1,      // rescue floor; 0 disables
-        "debug": true,          // verbose logging while you tune
-        "noTUI": false,         // false = show error toasts for routing failures
-        "extraIgnore": []       // provider slugs to always blacklist, e.g. "chutes"
+        "topN": 3, // how many cheapest providers stay routable
+        "keepAtLeastN": 1, // rescue floor; 0 disables
+        "debug": true, // verbose logging while you tune
+        "noTUI": false, // false = show error toasts for routing failures
+        "extraIgnore": [], // provider slugs to always blacklist, e.g. "chutes"
       },
     },
   ],
@@ -130,22 +117,43 @@ path override, used by tests).
 
 Configuration is strict. Unknown option names and invalid values abort plugin startup
 with a message naming the option and the expected type or range. Check the exact spelling
-in the table above; for example `topn` is rejected with a suggestion to use `topN`, and
+in the table above, for example `topn` is rejected with a suggestion to use `topN`, and
 `injectSort: 0` is rejected because booleans must be `true` or `false`. This is deliberate:
 silently falling back to a default would change routing without telling you.
+
+## How routing works
+
+For every OpenRouter model, the plugin filters endpoints by quality (context window,
+completion cap, uptime, tool-call support and error rate), ranks the survivors by
+expected cost, and lets only the cheapest few through. Three behaviors matter to know:
+
+- **Cheapest-first routing**: the `topN` cheapest survivors (default 3) stay routable
+  and `provider.sort: "price"` tells OpenRouter to prefer the cheapest of those.
+- **Free mode**: when any surviving provider serves the model at $0, every free provider
+  stays routable (the top-3 cap does not apply to them) and all paid providers are
+  blacklisted. Free status is judged at your workload's context length, so a tier that
+  prices long contexts does not sneak in.
+- **The rescue floor**: if the quality filters would starve the routing (e.g. only 1
+  endpoint exists, or all fail context/uptime checks), the `keepAtLeastN` floor keeps
+  the least-bad providers instead of sending the request unrouted. `0` disables the
+  floor, the default `1` guarantees at least one provider stands.
+
+The first request for a new model waits (up to `rankingWaitMs`, default 15s) for its
+ranking, so the session starts on the provider it will keep using and does not pay a
+cache-write charge twice. Refreshes run in the background and apply to the next request.
 
 ## Seeing routing failures
 
 A request the plugin cannot route is sent unfiltered, which can cost real money. The
-plugin refuses to let that happen silently: it writes a `Routing failure` message into
-the session transcript naming the model and the reason (no ranking available, no
-endpoint passed the filters and none could be kept by the `keepAtLeastN` floor, non-JSON
-body, routing error), once per session/model/reason.
+plugin refuses to let that happen silently: it writes a `Routing failure` message into the
+session transcript naming the model and the reason (no ranking available, no endpoint
+passed the filters and none could be kept by the `keepAtLeastN` floor, non-JSON body,
+routing error), once per session/model/reason.
 
 The package also ships a TUI part at the `./tui` export that raises an error toast for
 each of those messages, so the failure is visible even when you are not reading the
 transcript. It needs no extra configuration: one `plugins` entry loads every part of
-the package - OpenCode's TUI host resolves the `./tui` subpath export of the loaded
+the package, OpenCode's TUI host resolves the `./tui` subpath export of the loaded
 plugin automatically and runs it in the TUI process, where `@opentui/*` is already
 provided as peer dependencies. There is no `tui` key in `opencode.jsonc`; if you ever
 want only the TUI part (no server routing), reference the subpath directly, e.g.
@@ -175,7 +183,7 @@ size, so a long-context session is billed at the long-context rate, not the base
 
 **The rescue floor in detail**: a rescued provider stands as a whole (every alias of it
 goes back on the route), so a provider with any dead, unpriceable or tool-less alias is
-never rescued - that broken alias could get the traffic. In free mode only an all-free
+never rescued, that broken alias could get the traffic. In free mode only an all-free
 provider can be rescued. Rescued providers are named in a warning, so a relaxed filter
 is never silent.
 
@@ -183,7 +191,7 @@ How the blacklist is built from that cost, in one paragraph: each OpenRouter mod
 a single price point; its providers are ranked by the expected cost above (a cheap
 provider with a 3072-token output cap is excluded for workloads that write more than
 that). Endpoints that fail quality filters (context, completion cap, uptime, tool-call
-error rate) are excluded regardless of price - with one caveat: an endpoint with an
+error rate) are excluded regardless of price, with one caveat: an endpoint with an
 unparseable cache-write price is blacklisted rather than billing the cache write as $0,
 and an unparseable cache-read price is treated as "no cache" (cached input billed at the
 prompt rate). The ranking keeps the `topN` cheapest survivors; the `keepAtLeastN` floor
@@ -191,7 +199,51 @@ rescues the least-bad failures when nothing else stands, ordered by how badly ea
 provider failed (magnitude-weighted: context and tool-call error rate weigh most, the
 completion cap least).
 
-## Inspect the state
+## Storage
+
+The DB lives next to OpenCode's own storage (`~/.local/share/opencode`, honoring
+`XDG_DATA_HOME`) as `openrouter-optimizer.db`; every OpenCode instance and project
+feeds the same stats.
+
+## Package layout
+
+The published package exposes two parts, both compiled to ESM JavaScript with type
+declarations:
+
+| Export                              | Part   | Runs in             |
+| ----------------------------------- | ------ | ------------------- |
+| `opencode-openrouter-optimizer`     | server | the OpenCode server |
+| `opencode-openrouter-optimizer/tui` | TUI    | the OpenCode TUI    |
+
+## Development
+
+```sh
+bun install        # installs dependencies and builds dist/
+bun test           # unit tests: pricing formula, ranking, stats merge, db round-trip
+bun run typecheck
+bun run lint
+bun run fmt:check
+bun run build      # compiles src/ to dist/ (JavaScript, .d.ts and source maps)
+bun run verify     # format check, lint, typecheck and tests, the way CI runs them
+```
+
+A local clone can be loaded by OpenCode by path, the same way as the published package:
+
+```jsonc title="opencode.jsonc"
+{
+  "plugins": [
+    {
+      "package": "D:/t3-projects/opencode-openrouter-optimizer",
+      "options": { "debug": true },
+    },
+  ],
+}
+```
+
+The package entry points point at `dist/`, so run `bun run build` (or `bun install`, which
+builds it) before loading a clone by path.
+
+### Inspecting the state
 
 ```sh
 bun run inspect
@@ -212,17 +264,35 @@ Optional live network check (no OpenCode needed):
 bun run selfcheck [vendor/model]
 ```
 
-## Storage
+## Publishing
 
-The DB lives next to OpenCode's own storage (`~/.local/share/opencode`, honoring
-`XDG_DATA_HOME`) as `openrouter-optimizer.db`; every OpenCode instance and project
-feeds the same stats.
-
-## Development
+The package is published from this repository. A release on GitHub triggers the
+`Publish` workflow, which verifies the tree, builds it and publishes the tarball to npm
+with provenance. To publish by hand:
 
 ```sh
-bun install
-bun test       # unit tests: pricing formula, ranking, stats merge, db round-trip
-bun run typecheck
-bun run scripts/perf-probe.ts --live   # hot-path + snapshot size probe
+bun run verify     # the same checks CI runs
+npm publish --access public
 ```
+
+`prepublishOnly` runs the verification and `prepack` builds `dist/` before the tarball is
+written, so a published package always contains a fresh build and never contains tests,
+development scripts or local configuration. `npm pack --dry-run` shows the exact file
+list that would be published.
+
+To check an install the way OpenCode loads it, install the tarball in a scratch project
+and run the install check:
+
+```sh
+npm pack
+mkdir /tmp/check && cd /tmp/check && npm init -y
+npm install /path/to/opencode-openrouter-optimizer-0.1.0.tgz solid-js
+cp /path/to/repo/scripts/check-install.mjs .
+bun check-install.mjs
+```
+
+`solid-js` is a peer dependency that OpenCode provides at runtime. The check loads
+both parts and fails when either one is missing or has no plugin id.
+
+The package name on npm is `opencode-openrouter-optimizer`. The version in `package.json`
+is the published version, and `CHANGELOG.md` records what changed in it.

@@ -1,8 +1,8 @@
 /** Live smoke check (network): bun run scripts/selfcheck.ts [model-slug] */
 
-import { DEFAULT_OPTIONS } from "../src/config";
-import { fetchModelEndpoints } from "../src/openrouter";
-import { rankProviders } from "../src/ranking";
+import { DEFAULT_OPTIONS } from "../src/config.js";
+import { fetchModelEndpoints } from "../src/openrouter.js";
+import { rankProviders } from "../src/ranking.js";
 
 const model = process.argv[2] ?? "meta-llama/llama-3.3-70b-instruct";
 const data = await fetchModelEndpoints(model);

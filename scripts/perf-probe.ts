@@ -6,11 +6,11 @@
  * so the snapshot sizes reflect production data.
  */
 
-import { DEFAULT_OPTIONS } from "../src/config";
-import { OptimizerDb } from "../src/db";
-import { fetchModelEndpoints } from "../src/openrouter";
-import type { ProviderRank } from "../src/ranking";
-import { rankProviders } from "../src/ranking";
+import { DEFAULT_OPTIONS } from "../src/config.js";
+import { OptimizerDb } from "../src/db.js";
+import { fetchModelEndpoints } from "../src/openrouter.js";
+import type { ProviderRank } from "../src/ranking.js";
+import { rankProviders } from "../src/ranking.js";
 
 const live = process.argv.includes("--live");
 const profile = { avgInput: 20_000, avgOutput: 800, cacheHitRate: 0.4, numRequests: 42 };

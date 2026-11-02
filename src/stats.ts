@@ -13,10 +13,10 @@
  * provider's cache.
  */
 
-import { normalizeModelKey } from "./db";
-import type { RequestProfile } from "./pricing";
+import { normalizeModelKey } from "./db.js";
+import type { RequestProfile } from "./pricing.js";
 
-export { normalizeModelKey } from "./db";
+export { normalizeModelKey } from "./db.js";
 
 export interface LocalProfile {
   requests: number;

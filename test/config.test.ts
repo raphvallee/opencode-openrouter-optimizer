@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_OPTIONS, resolveOptions } from "../src/config";
+
+import { DEFAULT_OPTIONS, resolveOptions } from "../src/config.js";
 
 describe("resolveOptions", () => {
   test("returns defaults when no options are passed", () => {

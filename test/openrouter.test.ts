@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
+
 import {
   baseModelSlug,
   fetchModelEndpoints,
   fetchOpenRouterProfile,
   fetchToolCallErrorRate,
   OpenRouterError,
-} from "../src/openrouter";
+} from "../src/openrouter.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

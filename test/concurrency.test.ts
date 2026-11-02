@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { definePlugin } from "../src/plugin";
+
+import { definePlugin } from "../src/plugin.js";
 
 /**
  * Concurrency tests: the OpenCode server routes every client's requests through

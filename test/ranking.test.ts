@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_OPTIONS, resolveOptions } from "../src/config";
+
+import { DEFAULT_OPTIONS, resolveOptions } from "../src/config.js";
+import { isFreePricing } from "../src/pricing.js";
 import {
   composeRouting,
   filterEndpoint,
   rankProviders,
   providerSlug,
   type OpenRouterEndpoint,
-} from "../src/ranking";
-import { isFreePricing } from "../src/pricing";
+} from "../src/ranking.js";
 
 function endpoint(overrides: Partial<OpenRouterEndpoint> = {}): OpenRouterEndpoint {
   return {

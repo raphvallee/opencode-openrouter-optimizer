@@ -1,16 +1,17 @@
 /** Wiring: http.request interception, refresh (awaited on first sight), stats collection. */
 
 import { Plugin } from "@opencode/plugin";
-import { DEFAULT_OPTIONS, type OptimizerOptions, resolveOptions } from "./config";
-import { OptimizerDb, type RoutingSnapshot, type RoutingState, routingStateFromRow } from "./db";
+
+import { DEFAULT_OPTIONS, type OptimizerOptions, resolveOptions } from "./config.js";
+import { OptimizerDb, type RoutingSnapshot, type RoutingState, routingStateFromRow } from "./db.js";
 import {
   fetchModelEndpoints,
   fetchOpenRouterProfile,
   fetchToolCallErrorRate,
   permaslugFromEndpoints,
-} from "./openrouter";
-import { composeRouting, type ProviderRank, providerSlug, rankProviders } from "./ranking";
-import { type LocalProfile, mergeProfile, OpenCodeStats } from "./stats";
+} from "./openrouter.js";
+import { composeRouting, type ProviderRank, providerSlug, rankProviders } from "./ranking.js";
+import { type LocalProfile, mergeProfile, OpenCodeStats } from "./stats.js";
 
 interface HttpEventLike {
   request?: Request;

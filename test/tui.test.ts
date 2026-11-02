@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import tuiPlugin from "../src/tui";
+
+import tuiPlugin from "../src/tui.js";
 
 /** Minimal TUI host context: only what src/tui.ts touches. */
 function makeContext(options: Record<string, unknown> = {}) {

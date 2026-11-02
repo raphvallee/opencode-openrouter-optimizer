@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+
 import {
   effectiveRates,
   hasKnownPricing,
@@ -6,7 +7,7 @@ import {
   perRequestCost,
   requestCost,
   totalCost,
-} from "../src/pricing";
+} from "../src/pricing.js";
 
 const pricing = {
   prompt: "0.0000002", // $0.20/M

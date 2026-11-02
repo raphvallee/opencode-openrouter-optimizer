@@ -4,7 +4,8 @@ import { Database, type Statement } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { baseModelSlug } from "./openrouter";
+
+import { baseModelSlug } from "./openrouter.js";
 
 /**
  * Normalized cross-provider model key: lowercase, dots -> dashes, variant suffixes

@@ -3,27 +3,55 @@
   "version": "0.1.0",
   "description": "OpenCode plugin that ranks OpenRouter providers by cost and injects a per-request provider blacklist to keep routes cheap.",
   "keywords": [
+    "ai",
     "cost-optimization",
     "llm",
     "opencode",
     "opencode-plugin",
     "openrouter",
+    "pricing",
+    "provider-routing",
     "routing"
   ],
+  "homepage": "https://github.com/raphvallee/opencode-openrouter-optimizer#readme",
+  "bugs": {
+    "url": "https://github.com/raphvallee/opencode-openrouter-optimizer/issues"
+  },
   "license": "MIT",
+  "author": {
+    "name": "rafaelodos",
+    "url": "https://github.com/raphvallee"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/raphvallee/opencode-openrouter-optimizer.git"
+  },
   "files": [
-    "index.ts",
+    "dist",
     "src",
-    "scripts",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],
   "type": "module",
-  "main": "./index.ts",
-  "module": "./index.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./index.ts",
-    "./tui": "./src/tui.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js",
+      "default": "./dist/tui.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "bun test",
@@ -32,7 +60,13 @@
     "lint:fix": "oxlint --fix",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
-    "prepare": "husky",
+    "prepare": "husky && bun run build",
+    "clean": "node scripts/clean.mjs",
+    "build": "tsc -p tsconfig.build.json",
+    "verify": "bun run fmt:check && bun run lint && bun run typecheck && bun test",
+    "prepack": "bun run clean && bun run build",
+    "prepublishOnly": "bun run verify",
+    "pack:dry": "npm pack --dry-run",
     "inspect": "bun run scripts/inspect.ts",
     "selfcheck": "bun run scripts/selfcheck.ts",
     "debug:test": "bun --inspect-wait=6496 run test",
@@ -73,7 +107,7 @@
   "lint-staged": {
     "*.{js,mjs,cjs,ts,mts,cts,jsx,tsx}": [
       "oxlint --fix",
-      "oxfmt"
+      "oxfmt --no-error-on-unmatched-pattern"
     ]
   },
   "engines": {

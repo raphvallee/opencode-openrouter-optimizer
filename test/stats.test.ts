@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
+
+import { sumActivity, type ActivityRow } from "../src/openrouter.js";
 import {
   mergeProfile,
   OpenCodeStats,
   parseStatsModels,
   pickProfile,
   normalizeModelKey,
-} from "../src/stats";
-import { sumActivity, type ActivityRow } from "../src/openrouter";
+} from "../src/stats.js";
 
 describe("normalizeModelKey", () => {
   test("lowercases, dot-normalizes and strips variants", () => {

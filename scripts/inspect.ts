@@ -1,7 +1,8 @@
 /** Dump the optimizer DB: fetch/ranking state. Usage: bun run scripts/inspect.ts [--db path] */
 
 import { argv } from "bun";
-import { OptimizerDb, routingStateFromRow } from "../src/db";
+
+import { OptimizerDb, routingStateFromRow } from "../src/db.js";
 
 const flagIndex = argv.indexOf("--db");
 const path = flagIndex !== -1 ? argv[flagIndex + 1] : undefined;

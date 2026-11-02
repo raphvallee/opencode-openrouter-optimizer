@@ -5,10 +5,11 @@
  */
 
 import { argv } from "bun";
-import { DEFAULT_OPTIONS } from "../src/config";
-import { rankProviders } from "../src/ranking";
-import { fetchModelEndpoints } from "../src/openrouter";
-import type { RequestProfile } from "../src/pricing";
+
+import { DEFAULT_OPTIONS } from "../src/config.js";
+import { fetchModelEndpoints } from "../src/openrouter.js";
+import type { RequestProfile } from "../src/pricing.js";
+import { rankProviders } from "../src/ranking.js";
 
 const model = argv[2] ?? "deepseek/deepseek-chat-v3.1";
 // The fallback profile the plugin uses before any usage stats exist.

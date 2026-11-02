@@ -3,8 +3,9 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { definePlugin } from "../src/plugin";
-import { OptimizerDb } from "../src/db";
+
+import { OptimizerDb } from "../src/db.js";
+import { definePlugin } from "../src/plugin.js";
 
 /** Windows keeps SQLite WAL handles briefly after close; removal is best-effort. */
 function removeDir(dir: string): void {

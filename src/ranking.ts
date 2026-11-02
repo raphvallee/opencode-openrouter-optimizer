@@ -1,8 +1,8 @@
 /** Endpoint filtering, provider ranking and routing-body composition (all pure). */
 
-import type { OptimizerOptions } from "./config";
-import type { EndpointPricing, RequestProfile } from "./pricing";
-import { hasKnownPricing, isFreePricing, requestCost, totalCost } from "./pricing";
+import type { OptimizerOptions } from "./config.js";
+import type { EndpointPricing, RequestProfile } from "./pricing.js";
+import { hasKnownPricing, isFreePricing, requestCost, totalCost } from "./pricing.js";
 
 /** Subset of GET /api/v1/models/{author}/{slug}/endpoints we care about. */
 export interface OpenRouterEndpoint {

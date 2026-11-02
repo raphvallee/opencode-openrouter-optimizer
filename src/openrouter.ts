@@ -1,6 +1,6 @@
 /** OpenRouter HTTP clients (endpoints API: public; Activity API: management key). */
 
-import { providerSlug, type OpenRouterEndpoint } from "./ranking";
+import { providerSlug, type OpenRouterEndpoint } from "./ranking.js";
 
 const BASE_URL = "https://openrouter.ai/api/v1";
 const FRONTEND_BASE_URL = "https://openrouter.ai/api/frontend";
