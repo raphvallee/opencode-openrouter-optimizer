@@ -64,9 +64,17 @@ jobs:
             exit 1
           }
 
-      - name: Publish
+      - name: Update npm CLI
+        # Staged publishing requires npm >= 11.15; the npm bundled with node 22 is older.
+        run: npm install -g npm@^11.21.1
+
+      - name: Stage the package on npm
         env:
           PUBLISH_TAG: ${{ inputs.tag || 'latest' }}
-          # Only needed when the package is not set up for npm trusted publishing.
+          # Not needed with npm trusted publishing (OIDC); keep empty to stage via OIDC.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public --tag "$PUBLISH_TAG"
+        run: |
+          npm stage publish --provenance --access public --tag "$PUBLISH_TAG"
+          echo ""
+          echo "Package staged on npm. Approve it with 2FA under"
+          echo "https://www.npmjs.com/package/opencode-openrouter-optimizer -> Staged Packages"
