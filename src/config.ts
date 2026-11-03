@@ -1,5 +1,7 @@
 /** Plugin configuration resolved from opencode.json plugin options plus sane defaults. */
 
+import { stripControlChars } from "./sanitize.js";
+
 export interface OptimizerOptions {
   /** Re-fetch prices + re-rank when last_fetched is older than this many hours. */
   ttlHours: number;
@@ -133,10 +135,27 @@ const OPTION_KEYS: ReadonlyArray<keyof OptimizerOptions> = [
 
 const VALID_KEYS = new Set<string>(OPTION_KEYS);
 
-function describe(value: unknown): string {
+/** Upper bound on values we report in error messages; echoes get cut off here. */
+const DESCRIBE_MAX = 200;
+
+/** Option names matching this are never echoed back: their values may be secrets. */
+const SECRETISH_KEY = /key|token|secret/i;
+
+/** Replace control chars so a pasted secret can never smear across the log. */
+function scrubControls(text: string): string {
+  return stripControlChars(text);
+}
+
+function describe(value: unknown, key = ""): string {
   if (value === null) return "null";
   if (value === undefined) return "undefined";
-  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "string") {
+    if (SECRETISH_KEY.test(key)) return "[redacted]";
+    const scrubbed = scrubControls(value);
+    return scrubbed.length > DESCRIBE_MAX
+      ? `${JSON.stringify(scrubbed.slice(0, DESCRIBE_MAX))}...`
+      : JSON.stringify(scrubbed);
+  }
   if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint")
     return String(value);
   if (Array.isArray(value)) return `an array (length ${value.length})`;
@@ -171,10 +190,10 @@ function numberOption(
   } else if (typeof value === "string" && value.trim().length > 0) {
     parsed = Number(value.trim());
   } else {
-    return invalid(key, `must be a finite number, got ${describe(value)}`);
+    return invalid(key, `must be a finite number, got ${describe(value, key)}`);
   }
   if (!Number.isFinite(parsed))
-    return invalid(key, `must be a finite number, got ${describe(value)}`);
+    return invalid(key, `must be a finite number, got ${describe(value, key)}`);
   if (rule.min !== undefined && parsed < rule.min) {
     return invalid(key, `must be >= ${rule.min}, got ${parsed}`);
   }
@@ -197,7 +216,73 @@ function booleanOption(
   if (typeof value === "boolean") return value;
   if (value === "true") return true;
   if (value === "false") return false;
-  return invalid(key, `must be a boolean (true or false), got ${describe(value)}`);
+  return invalid(key, `must be a boolean (true or false), got ${describe(value, key)}`);
+}
+
+function hasControlChars(text: string): boolean {
+  return stripControlChars(text) !== text;
+}
+
+/** Windows absolute paths carry a drive letter, POSIX ones carry a leading slash. */
+function looksAbsolutePath(text: string): boolean {
+  return text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text) || text.startsWith("~/");
+}
+
+/** A bare binary name: no path separators, nothing executable-shaped elsewhere. */
+const BARE_COMMAND_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function statsCommandOption(
+  raw: Record<string, unknown>,
+  key: keyof OptimizerOptions,
+  fallback: string,
+): string {
+  const value = stringOption(raw, key, fallback);
+  const isPath = value.includes("/") || value.includes("\\");
+  if (isPath) {
+    if (!looksAbsolutePath(value)) {
+      return invalid(
+        key,
+        `must be a bare command name or an absolute path, got ${describe(value, key)}`,
+      );
+    }
+    return value;
+  }
+  if (!BARE_COMMAND_RE.test(value)) {
+    return invalid(
+      key,
+      `must match ${BARE_COMMAND_RE.source} (a simple binary name), got ${describe(value, key)}`,
+    );
+  }
+  return value;
+}
+
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/** Well-known secrets that must never ride along as an arbitrary Bearer header. */
+const FORBIDDEN_MANAGEMENT_KEY_ENV =
+  /^(AWS_|GITHUB_TOKEN$|GH_TOKEN$|NPM_TOKEN$|OPENAI_API_KEY$|ANTHROPIC_API_KEY$|GEMINI_API_KEY$|SLACK_)/i;
+
+function managementKeyEnvOption(
+  raw: Record<string, unknown>,
+  key: keyof OptimizerOptions,
+  fallback: string,
+): string {
+  const value = stringOption(raw, key, fallback);
+  if (!ENV_NAME_RE.test(value)) {
+    return invalid(key, `must be a valid environment variable name, got ${describe(value, key)}`);
+  }
+  if (FORBIDDEN_MANAGEMENT_KEY_ENV.test(value)) {
+    return invalid(
+      key,
+      `refusing to send the credential in "${value}" as a Bearer token to openrouter.ai; set the management key in a dedicated variable`,
+    );
+  }
+  if (value !== fallback) {
+    console.warn(
+      `[openrouter-optimizer] managementKeyEnv is set to "${value}"; its value will be sent as an Authorization: Bearer header to openrouter.ai on every refresh.`,
+    );
+  }
+  return value;
 }
 
 function stringOption(
@@ -207,9 +292,14 @@ function stringOption(
 ): string {
   const value = raw[key];
   if (value === undefined) return fallback;
-  if (typeof value !== "string") return invalid(key, `must be a string, got ${describe(value)}`);
+  if (typeof value !== "string")
+    return invalid(key, `must be a string, got ${describe(value, key)}`);
+  if (hasControlChars(value))
+    return invalid(key, `must not contain control characters, got ${describe(value, key)}`);
   const trimmed = value.trim();
   if (trimmed.length === 0) return invalid(key, "must be a non-empty string");
+  if (trimmed.length > 1024)
+    return invalid(key, `must be at most 1024 characters, got ${trimmed.length}`);
   return trimmed;
 }
 
@@ -220,9 +310,13 @@ function optionalStringOption(
   const value = raw[key];
   if (value === undefined) return undefined;
   if (typeof value !== "string")
-    return invalid(key, `must be a string when set, got ${describe(value)}`);
+    return invalid(key, `must be a string when set, got ${describe(value, key)}`);
   const trimmed = value.trim();
   if (trimmed.length === 0) return invalid(key, "must be a non-empty string when set");
+  if (hasControlChars(value))
+    return invalid(key, `must not contain control characters, got ${describe(value, key)}`);
+  if (trimmed.length > 1024)
+    return invalid(key, `must be at most 1024 characters, got ${trimmed.length}`);
   return trimmed;
 }
 
@@ -233,20 +327,33 @@ function optionalFunctionOption(
   const value = raw[key];
   if (value === undefined) return undefined;
   if (typeof value !== "function")
-    return invalid(key, `must be a function when set, got ${describe(value)}`);
+    return invalid(key, `must be a function when set, got ${describe(value, key)}`);
   return value as (args: string[]) => Promise<string>;
 }
+
+const SLUG_OPTION_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 function listOption(raw: Record<string, unknown>, key: keyof OptimizerOptions): string[] {
   const value = raw[key];
   if (value === undefined) return [];
   if (!Array.isArray(value))
-    return invalid(key, `must be an array of non-empty strings, got ${describe(value)}`);
+    return invalid(key, `must be an array of non-empty strings, got ${describe(value, key)}`);
+  if (value.length > 512)
+    return invalid(key, `must hold at most 512 entries, got an array of length ${value.length}`);
   return value.map((entry, index) => {
-    if (typeof entry !== "string" || entry.trim().length === 0) {
-      return invalid(`${key}[${index}]`, `must be a non-empty string, got ${describe(entry)}`);
+    if (typeof entry !== "string")
+      return invalid(`${key}[${index}]`, `must be a non-empty string, got ${describe(entry, key)}`);
+    const trimmed = entry.trim().toLowerCase();
+    if (trimmed.length === 0) {
+      return invalid(`${key}[${index}]`, `must be a non-empty string, got ${describe(entry, key)}`);
     }
-    return entry.trim();
+    if (!SLUG_OPTION_RE.test(trimmed)) {
+      return invalid(
+        `${key}[${index}]`,
+        `must match ${SLUG_OPTION_RE.source} (a provider slug like "chutes"), got ${describe(entry, key)}`,
+      );
+    }
+    return trimmed;
   });
 }
 
@@ -274,7 +381,7 @@ export function resolveOptions(input?: unknown): OptimizerOptions {
   const raw = input as Record<string, unknown>;
   validateUnknownKeys(raw);
   return {
-    ttlHours: numberOption(raw, "ttlHours", DEFAULT_OPTIONS.ttlHours, { min: 0 }),
+    ttlHours: numberOption(raw, "ttlHours", DEFAULT_OPTIONS.ttlHours, { min: 0, max: 720 }),
     topN: numberOption(raw, "topN", DEFAULT_OPTIONS.topN, { min: 1, integer: true }),
     keepAtLeastN: numberOption(raw, "keepAtLeastN", DEFAULT_OPTIONS.keepAtLeastN, {
       min: 0,
@@ -314,6 +421,7 @@ export function resolveOptions(input?: unknown): OptimizerOptions {
     injectSort: booleanOption(raw, "injectSort", DEFAULT_OPTIONS.injectSort),
     rankingWaitMs: numberOption(raw, "rankingWaitMs", DEFAULT_OPTIONS.rankingWaitMs, {
       min: 0,
+      max: 30_000,
       integer: true,
     }),
     fallbackAvgInput: numberOption(raw, "fallbackAvgInput", DEFAULT_OPTIONS.fallbackAvgInput, {
@@ -338,11 +446,20 @@ export function resolveOptions(input?: unknown): OptimizerOptions {
     ),
     noTUI: booleanOption(raw, "noTUI", DEFAULT_OPTIONS.noTUI),
     extraIgnore: listOption(raw, "extraIgnore"),
-    managementKeyEnv: stringOption(raw, "managementKeyEnv", DEFAULT_OPTIONS.managementKeyEnv),
-    statsCommand: stringOption(raw, "statsCommand", DEFAULT_OPTIONS.statsCommand),
-    statsDays: numberOption(raw, "statsDays", DEFAULT_OPTIONS.statsDays, { min: 1, integer: true }),
+    managementKeyEnv: managementKeyEnvOption(
+      raw,
+      "managementKeyEnv",
+      DEFAULT_OPTIONS.managementKeyEnv,
+    ),
+    statsCommand: statsCommandOption(raw, "statsCommand", DEFAULT_OPTIONS.statsCommand),
+    statsDays: numberOption(raw, "statsDays", DEFAULT_OPTIONS.statsDays, {
+      min: 1,
+      max: 365,
+      integer: true,
+    }),
     statsCacheMinutes: numberOption(raw, "statsCacheMinutes", DEFAULT_OPTIONS.statsCacheMinutes, {
       min: 0,
+      max: 1440,
     }),
     statsRun: optionalFunctionOption(raw, "statsRun"),
     dbPath: optionalStringOption(raw, "dbPath"),

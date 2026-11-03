@@ -9,3 +9,20 @@ dist
 .tmp-*
 *.tmp
 .playwright-mcp/
+# Secrets and local state (never commit these)
+.env
+.env.*
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
+coverage/
+*.tsbuildinfo
+*.bak

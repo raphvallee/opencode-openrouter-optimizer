@@ -14,18 +14,25 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    environment: release
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          bun-version: latest
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
@@ -33,14 +40,33 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify the release tag matches package.json
+        if: github.event_name == 'release'
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$VERSION" || {
+            echo "Release tag '$GITHUB_REF_NAME' does not match package.json version '$VERSION'"
+            exit 1
+          }
+
       - name: Verify
         run: bun run verify
 
       - name: Build
         run: bun run build
 
-      - name: Publish
-        run: npm publish --provenance --access public --tag ${{ inputs.tag || 'latest' }}
+      - name: Validate the npm dist-tag
         env:
+          PUBLISH_TAG: ${{ inputs.tag || 'latest' }}
+        run: |
+          printf '%s' "$PUBLISH_TAG" | grep -E '^[a-z0-9][a-z0-9._-]{0,127}$' > /dev/null || {
+            echo "Invalid npm tag: must match ^[a-z0-9][a-z0-9._-]{0,127}\$"
+            exit 1
+          }
+
+      - name: Publish
+        env:
+          PUBLISH_TAG: ${{ inputs.tag || 'latest' }}
           # Only needed when the package is not set up for npm trusted publishing.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public --tag "$PUBLISH_TAG"

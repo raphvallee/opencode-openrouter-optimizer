@@ -1,11 +1,12 @@
 /** bun:sqlite access layer: per-model fetch/ranking state, hot routing snapshot. */
 
 import { Database, type Statement } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, lstatSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { baseModelSlug } from "./openrouter.js";
+import { stripControlChars } from "./sanitize.js";
 
 /**
  * Normalized cross-provider model key: lowercase, dots -> dashes, variant suffixes
@@ -77,6 +78,7 @@ const SCHEMA = `
 `;
 
 const MIGRATION_COLUMNS: Array<[string, string]> = [
+  ["last_fetched", "INTEGER"],
   ["last_attempt", "INTEGER"],
   ["attempts", "INTEGER NOT NULL DEFAULT 0"],
   ["retry_after", "INTEGER"],
@@ -94,53 +96,106 @@ const SELECT_COLUMNS = `model, last_fetched, last_attempt, attempts, retry_after
 const SELECT_COLUMNS_LEAN = `model, last_fetched, last_attempt, attempts, retry_after,
   survivors_json, blacklist_json, mode, computed_at, updated_at`;
 
+/**
+ * Resolve the configured path to a stable absolute one. ":memory:" passes through;
+ * anything else is resolved against the CWD for relative paths, which is exactly
+ * how the filesystem would interpret it anyway.
+ */
 function openPath(explicit?: string): string {
-  if (explicit) return explicit;
+  if (explicit === ":memory:") return explicit;
+  if (explicit) return resolve(explicit);
   const xdg = process.env.XDG_DATA_HOME;
   const base = xdg ? join(xdg, "opencode") : join(homedir(), ".local", "share", "opencode");
   return join(base, "openrouter-optimizer.db");
 }
 
-function parseBlacklist(json: string | null): string[] | null {
-  if (json === null) return [];
+/** Provider slugs are short lowercase tags; anything else is damaged data. */
+const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+/** Hard ceiling on persisted slug lists, so no refresh can balloon the db or requests. */
+const MAX_SLUGS = 512;
+/** Disk timestamps may not be more than this far in the future (clock skew). */
+const MAX_FUTURE_SKEW_MS = 5 * 60_000;
+
+function isSlug(value: string): boolean {
+  return SLUG_RE.test(value);
+}
+
+/** Clamp a stored timestamp into the sane range; unusable values read as "never". */
+function cleanTimestamp(value: number | null, now: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  // A future timestamp would make a row look fresh forever; clamp it to now.
+  return value > now + MAX_FUTURE_SKEW_MS ? now : value;
+}
+
+function parseSlugArray(json: string | null, emptyWhenNull: "empty" | "null"): string[] | null {
+  if (json === null) return emptyWhenNull === "empty" ? [] : null;
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(json);
-    if (!Array.isArray(parsed)) return null;
-    // A blacklist entry that is not a string means the row is damaged. Treat the
-    // whole snapshot as unreadable so the next request re-ranks instead of silently
-    // dropping a provider from the blacklist and re-allowing its traffic.
-    if (parsed.some((value) => typeof value !== "string")) return null;
-    return parsed as string[];
+    parsed = JSON.parse(json);
   } catch {
     return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length > MAX_SLUGS) return null;
+  const seen = new Set<string>();
+  for (const value of parsed) {
+    if (typeof value !== "string" || !isSlug(value)) return null;
+    seen.add(value);
+  }
+  return [...seen];
+}
+
+/** Rename a broken database out of the way; keeps it for forensics, never deletes. */
+function quarantineFile(file: string): void {
+  for (const candidate of [file, `${file}-wal`, `${file}-shm`]) {
+    if (!existsSync(candidate)) continue;
+    try {
+      renameSync(candidate, `${candidate}.corrupt-${Date.now()}`);
+    } catch {
+      // leave it; opening will fail loudly below
+    }
   }
 }
 
-/**
- * Strict variant for survivors_json. Corrupt or non-array JSON returns null
- * instead of [], so a damaged row reads as "never ranked": routing becomes
- * undefined and the next request forces a re-rank, instead of a phantom
- * zero-survivor ranking silently passing requests through unrouted for the
- * whole TTL. A legitimately empty ranking still parses as [] and keeps its
- * routing snapshot.
- */
+function warnLocal(message: string, detail?: unknown): void {
+  const suffix =
+    detail === undefined ? "" : ` ${detail instanceof Error ? detail.message : String(detail)}`;
+  console.warn(`[openrouter-optimizer] ${stripControlChars(message)}${stripControlChars(suffix)}`);
+}
+
+function parseBlacklist(json: string | null): string[] | null {
+  return parseSlugArray(json, "empty");
+}
+
 function parseSurvivors(json: string | null): string[] | null {
-  if (json === null) return null;
-  try {
-    const parsed = JSON.parse(json);
-    return Array.isArray(parsed)
-      ? parsed.filter((value): value is string => typeof value === "string")
-      : null;
-  } catch {
-    return null;
-  }
+  return parseSlugArray(json, "null");
 }
 
 function parseDetails(json: string | null): unknown[] | undefined {
   if (!json) return undefined;
   try {
     const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed : undefined;
+    if (!Array.isArray(parsed)) return undefined;
+    const out: unknown[] = [];
+    for (const entry of parsed.slice(0, 1_000)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const record = entry as Record<string, unknown>;
+      if (typeof record.slug !== "string" || !isSlug(record.slug)) continue;
+      if (
+        record.perRequest !== undefined &&
+        (typeof record.perRequest !== "number" || !Number.isFinite(record.perRequest))
+      ) {
+        continue;
+      }
+      if (
+        record.failedReasons !== undefined &&
+        (!Array.isArray(record.failedReasons) ||
+          record.failedReasons.some((reason) => typeof reason !== "string" || reason.length > 200))
+      ) {
+        continue;
+      }
+      out.push(entry);
+    }
+    return out;
   } catch {
     return undefined;
   }
@@ -155,16 +210,20 @@ function parseBlacklistReasons(json: string | null): Record<string, string[]> | 
   try {
     const parsed: unknown = JSON.parse(json);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-    const out: Record<string, string[]> = {};
+    const out: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+    let entries = 0;
     for (const [slug, reasons] of Object.entries(parsed)) {
+      if (entries >= MAX_SLUGS) return undefined;
+      if (!isSlug(slug) || slug === "__proto__") return undefined;
       if (
-        slug.length === 0 ||
         !Array.isArray(reasons) ||
-        reasons.some((r) => typeof r !== "string")
+        reasons.length > 32 ||
+        reasons.some((r) => typeof r !== "string" || r.length > 200)
       ) {
         return undefined;
       }
       out[slug] = reasons as string[];
+      entries += 1;
     }
     return out;
   } catch {
@@ -178,23 +237,28 @@ function modeOf(value: string | null): "free" | "cheapest" {
 
 /** Build the in-memory state from a stored row. Parsing stays in one place. */
 export function routingStateFromRow(row: FetchRow, withDetails = true): RoutingState {
+  const now = Date.now();
   const survivors = parseSurvivors(row.survivors_json);
   const blacklist = parseBlacklist(row.blacklist_json);
+  const lastFetched = cleanTimestamp(row.last_fetched, now);
+  const lastAttempt = cleanTimestamp(row.last_attempt, now);
+  const retryAfter = cleanTimestamp(row.retry_after, now);
+  const computedAt = cleanTimestamp(row.computed_at ?? row.updated_at, now);
   const routing: RoutingSnapshot | undefined =
-    survivors !== null && blacklist !== null
+    survivors !== null && blacklist !== null && computedAt !== null
       ? {
           survivors,
           blacklist,
-          computedAt: row.computed_at ?? row.updated_at,
+          computedAt,
           mode: modeOf(row.mode),
         }
       : undefined;
   return {
     model: row.model,
-    lastFetched: row.last_fetched,
-    lastAttempt: row.last_attempt,
-    attempts: row.attempts ?? 0,
-    retryAfter: row.retry_after,
+    lastFetched,
+    lastAttempt,
+    attempts: Math.max(0, Number.isFinite(row.attempts) ? row.attempts : 0),
+    retryAfter,
     routing,
     details: withDetails ? parseDetails(row.details_json) : undefined,
     blacklistReasons: withDetails ? parseBlacklistReasons(row.blacklist_reasons_json) : undefined,
@@ -293,6 +357,107 @@ function migrate(db: Database): void {
   }
 }
 
+/**
+ * Stat the existing file and refuse anything but an owned regular file. There is a
+ * small residual TOCTOU window between this check and the SQLite open; closing it
+ * would require passing an O_NOFOLLOW file descriptor into the engine, which
+ * bun:sqlite does not expose. Local write access to the data directory is therefore
+ * still trusted - the checks catch mistakes, not an active same-uid attacker.
+ */
+function validateExistingFile(file: string): void {
+  let stat;
+  try {
+    stat = lstatSync(file);
+  } catch {
+    return; // does not exist yet: fine
+  }
+  if (!stat.isFile()) {
+    throw new Error(`refusing to open the optimizer database at ${file}: not a regular file`);
+  }
+  if (stat.nlink > 1) {
+    throw new Error(
+      `refusing to open the optimizer database at ${file}: it has ${stat.nlink} hard links`,
+    );
+  }
+  if (typeof process.getuid === "function") {
+    const uid = process.getuid();
+    if (stat.uid !== uid) {
+      throw new Error(
+        `refusing to open the optimizer database at ${file}: owned by uid ${stat.uid}, not uid ${uid}`,
+      );
+    }
+  }
+}
+
+/** Create the parent directory owner-only; pre-existing dirs are left alone. */
+function createParentDirectory(dir: string): void {
+  const existed = existsSync(dir);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (!existed && typeof process.getuid === "function") {
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+/**
+ * A file is "ours" only when its fetches table carries the columns any released
+ * version created (current compact rows have blacklist_json; pre-compact rows
+ * carry the legacy rankings_json/endpoints_json pair; both have model/updated_at).
+ * Anything else is treated as foreign and left untouched.
+ */
+function hasOurTables(db: Database): boolean {
+  try {
+    const cols = db.prepare("PRAGMA table_info(fetches)").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((column) => column.name));
+    const hasIdentity = names.has("model") && names.has("updated_at");
+    const hasOurMarker =
+      names.has("blacklist_json") || names.has("rankings_json") || names.has("endpoints_json");
+    return hasIdentity && hasOurMarker;
+  } catch {
+    return false;
+  }
+}
+
+/** Open and verify the db; `expectRecognized` rejects foreign files unmodified. */
+function openVerifiedDb(file: string, expectRecognized: boolean): Database {
+  const db = new Database(file, { create: true });
+  try {
+    const row = db.prepare("PRAGMA quick_check(1)").get() as Record<string, unknown> | undefined;
+    const check = row ? Object.values(row)[0] : "ok";
+    if (check !== "ok") {
+      throw new Error(`database fails PRAGMA quick_check: ${String(check)}`);
+    }
+    if (expectRecognized && !hasOurTables(db)) {
+      throw new Error(
+        `FOREIGNDB: ${file} is not an optimizer database (missing optimizer columns); set "dbPath" to a different file, nothing was modified`,
+      );
+    }
+    return db;
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // best effort
+    }
+    throw error;
+  }
+}
+
+/** Owner-only permissions on the file and any existing WAL/SHM sidecars (POSIX). */
+function hardenFilePermissions(file: string): void {
+  if (file === ":memory:" || typeof process.getuid !== "function") return;
+  for (const candidate of [file, `${file}-wal`, `${file}-shm`]) {
+    try {
+      chmodSync(candidate, 0o600);
+    } catch {
+      // best effort; platform may not support chmod
+    }
+  }
+}
+
 export class OptimizerDb {
   private readonly db: Database;
   private readonly selectFetch: Statement;
@@ -306,11 +471,35 @@ export class OptimizerDb {
   private readonly resetUnreadableStmt: Statement;
   private closed = false;
 
+  /** Marks a file that "looks like a database but is not ours"; never quarantined. */
+  private static isForeignDb(error: unknown): boolean {
+    return error instanceof Error && error.message.startsWith("FOREIGNDB:");
+  }
+
   constructor(path?: string) {
     const file = openPath(path);
-    const dir = dirname(file);
-    if (file !== ":memory:" && dir && dir !== ".") mkdirSync(dir, { recursive: true });
-    this.db = new Database(file, { create: true });
+    const isMemory = file === ":memory:";
+    const existed = isMemory ? false : existsSync(file) && lstatSync(file).size > 0;
+    if (!isMemory) {
+      validateExistingFile(file);
+      const dir = dirname(file);
+      if (dir && dir !== ".") createParentDirectory(dir);
+    }
+    let db: Database;
+    try {
+      db = openVerifiedDb(file, existed);
+    } catch (error) {
+      if (OptimizerDb.isForeignDb(error) || isMemory || !existed) throw error;
+      // Broken file (not a database, or fails quick_check): move it aside and
+      // start fresh. The broken file is kept for forensics, never deleted.
+      warnLocal(
+        `database at ${file} is unreadable; moved aside and recreated from scratch.`,
+        error,
+      );
+      quarantineFile(file);
+      db = openVerifiedDb(file, false);
+    }
+    this.db = db;
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA synchronous = NORMAL;");
     this.db.exec("PRAGMA busy_timeout = 3000;");
@@ -319,10 +508,11 @@ export class OptimizerDb {
     // Usage is no longer tracked by the plugin (dropped in favor of OpenCode's own
     // `stats --json` data); remove the legacy table from pre-existing DB files.
     this.db.exec("DROP TABLE IF EXISTS usage;");
+    hardenFilePermissions(file);
 
     this.selectFetch = this.db.prepare(`SELECT ${SELECT_COLUMNS} FROM fetches WHERE model = ?`);
-    this.selectAll = this.db.prepare(`SELECT ${SELECT_COLUMNS} FROM fetches`);
-    this.selectAllLean = this.db.prepare(`SELECT ${SELECT_COLUMNS_LEAN} FROM fetches`);
+    this.selectAll = this.db.prepare(`SELECT ${SELECT_COLUMNS} FROM fetches LIMIT 5000`);
+    this.selectAllLean = this.db.prepare(`SELECT ${SELECT_COLUMNS_LEAN} FROM fetches LIMIT 5000`);
     this.insertFetchRow = this.db.prepare(
       `INSERT OR IGNORE INTO fetches (model, updated_at) VALUES (?, ?)`,
     );
@@ -428,18 +618,27 @@ export class OptimizerDb {
     blacklistReasons?: Record<string, string[]>,
   ): void {
     this.assertOpen();
+    const survivors = [...new Set(routing.survivors)].filter(isSlug).slice(0, MAX_SLUGS);
+    const blacklist = [...new Set(routing.blacklist)].filter(isSlug).slice(0, MAX_SLUGS);
+    const detailsJson =
+      details && details.length > 0 ? JSON.stringify(details.slice(0, 1_000)) : null;
+    const reasonsJson =
+      blacklistReasons && Object.keys(blacklistReasons).length > 0
+        ? JSON.stringify(blacklistReasons)
+        : null;
+    const MAX_PAYLOAD = 256 * 1024;
+    const detailsOut = detailsJson && detailsJson.length > MAX_PAYLOAD ? null : detailsJson;
+    const reasonsOut = reasonsJson && reasonsJson.length > MAX_PAYLOAD ? null : reasonsJson;
     this.saveRefreshStmt.run(
       model,
       now,
       now,
-      JSON.stringify(routing.survivors),
-      JSON.stringify(routing.blacklist),
+      JSON.stringify(survivors),
+      JSON.stringify(blacklist),
       routing.mode ?? "cheapest",
       routing.computedAt,
-      details && details.length > 0 ? JSON.stringify(details) : null,
-      blacklistReasons && Object.keys(blacklistReasons).length > 0
-        ? JSON.stringify(blacklistReasons)
-        : null,
+      detailsOut,
+      reasonsOut,
       now,
     );
   }
@@ -495,6 +694,7 @@ export class OptimizerDb {
     );
   }
 
+  /** `state()` is for tooling; never returns an unbounded scan either. */
   state(): { fetches: FetchRow[] } {
     return { fetches: this.selectAll.all() as FetchRow[] };
   }

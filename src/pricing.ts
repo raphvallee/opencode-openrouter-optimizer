@@ -67,22 +67,29 @@ export interface Rates {
 
 type ParsedPrice = { kind: "absent" } | { kind: "known"; value: number } | { kind: "invalid" };
 
+/** Prices above this ceiling are treated as unknown pricing, never as real numbers. */
+const MAX_REASONABLE_PRICE = 1e9;
+
 /**
  * Parse a price without guessing. "absent" means the field was omitted; "invalid" means
  * it was present but is not a finite non-negative number ("", "N/A", "free", -1, ...).
  * The distinction matters for cache fields: an absent cache price means "not offered",
  * while an invalid one is unknown pricing that must not be silently treated as $0.
+ * Absurdly large values (> 1e9 USD per token) are also invalid: they are never a real
+ * quote and only serve to break downstream math (Infinity, NaN comparisons).
  */
 function parsePrice(value: string | number | null | undefined): ParsedPrice {
   if (value === null || value === undefined) return { kind: "absent" };
   if (typeof value === "number") {
-    return Number.isFinite(value) && value >= 0 ? { kind: "known", value } : { kind: "invalid" };
+    return Number.isFinite(value) && value >= 0 && value <= MAX_REASONABLE_PRICE
+      ? { kind: "known", value }
+      : { kind: "invalid" };
   }
   if (typeof value !== "string") return { kind: "invalid" };
   const trimmed = value.trim();
   if (trimmed === "") return { kind: "invalid" };
   const parsed = Number(trimmed);
-  return Number.isFinite(parsed) && parsed >= 0
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= MAX_REASONABLE_PRICE
     ? { kind: "known", value: parsed }
     : { kind: "invalid" };
 }
@@ -204,6 +211,9 @@ function resolveTierPrices(pricing: EndpointPricing, contextSize: number | undef
  * price, as on the base level.
  */
 export function hasKnownPricing(pricing: EndpointPricing, contextSize?: number): boolean {
+  if (!pricing || typeof pricing !== "object" || Array.isArray(pricing)) return false;
+  // A discount of 100% or more is not a sale, it is a broken price document.
+  if (parseDiscount(pricing.discount) >= 1) return false;
   if (
     parsePrice(pricing.prompt).kind !== "known" ||
     parsePrice(pricing.completion).kind !== "known" ||
@@ -236,6 +246,7 @@ export function hasKnownPricing(pricing: EndpointPricing, contextSize?: number):
  * that size: an endpoint free below a threshold is paid above it, and vice versa.
  */
 export function isFreePricing(pricing: EndpointPricing, contextSize?: number): boolean {
+  if (!pricing || typeof pricing !== "object" || Array.isArray(pricing)) return false;
   const tier = resolveTierPrices(pricing, contextSize);
   const prompt = parsePrice(tier.prompt);
   const completion = parsePrice(tier.completion);
@@ -251,10 +262,17 @@ export function isFreePricing(pricing: EndpointPricing, contextSize?: number): b
 }
 
 export function effectiveRates(pricing: EndpointPricing, contextSize?: number): Rates {
+  // Exported for the cost model; never produce a silent $0 from unknown pricing,
+  // not even for direct callers that skip requestCost/hasKnownPricing.
+  if (!hasKnownPricing(pricing, contextSize)) {
+    throw new Error("effectiveRates called with unknown or unparseable pricing");
+  }
   const tier = resolveTierPrices(pricing, contextSize);
   const rawDiscount = parseDiscount(pricing.discount);
-  // Discounts theoretically live in [0, 1]; anything outside is treated as no discount.
-  const discount = rawDiscount > 0 && rawDiscount <= 1 ? rawDiscount : 0;
+  // Discounts live in [0, 1]; anything outside is treated as no discount. Cap the
+  // honoured discount at 50%: anything deeper is a broken price document, not a
+  // sale, and must never zero out every rate and win the price sort.
+  const discount = rawDiscount > 0 && rawDiscount <= 0.5 ? rawDiscount : 0;
   const scale = 1 - discount;
   const inputRate = (parseRequiredPrice(tier.prompt) ?? 0) * scale;
   const read = parsePrice(tier.input_cache_read);
@@ -285,8 +303,11 @@ export interface RequestProfile {
   numRequests: number;
 }
 
+const clamp01 = (value: number): number =>
+  Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+
 export function perRequestCost(rates: Rates, profile: RequestProfile): number {
-  const h = Math.min(1, Math.max(0, profile.cacheHitRate));
+  const h = clamp01(profile.cacheHitRate);
   const input =
     profile.avgInput * (h * rates.readRate + (1 - h) * (rates.inputRate + rates.writeRate));
   const output = profile.avgOutput * rates.outputRate;

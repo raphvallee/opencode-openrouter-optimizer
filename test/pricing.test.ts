@@ -48,17 +48,16 @@ describe("effectiveRates", () => {
     }
   });
 
-  test("malformed discount is ignored", () => {
-    const rates = effectiveRates({ ...pricing, discount: 2 });
-    expect(rates.discount).toBe(0);
-    expect(rates.inputRate).toBe(0.0000002);
+  test("a discount of 1 or more is rejected as unknown pricing", () => {
+    expect(hasKnownPricing({ ...pricing, discount: 1 })).toBe(false);
+    expect(hasKnownPricing({ ...pricing, discount: 2 })).toBe(false);
+    expect(() => effectiveRates({ ...pricing, discount: 1 })).toThrow(/unknown/);
   });
 
-  test("discount of exactly 1 is applied, not rejected", () => {
-    const rates = effectiveRates({ ...pricing, discount: 1 });
-    expect(rates.discount).toBe(1);
-    expect(rates.inputRate).toBe(0);
-    expect(rates.outputRate).toBe(0);
+  test("a discount above 50% is not honoured", () => {
+    const rates = effectiveRates({ ...pricing, discount: 0.75 });
+    expect(rates.discount).toBe(0);
+    expect(rates.inputRate).toBe(0.0000002);
   });
 });
 

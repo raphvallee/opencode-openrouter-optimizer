@@ -2,6 +2,8 @@
 
 import { Plugin } from "@opencode/plugin/tui";
 
+import { sanitizeForOutput } from "./sanitize.js";
+
 /**
  * Must match ROUTING_FAILURE_METADATA_KEY in src/plugin.ts. Duplicated on purpose:
  * this file runs in the TUI process and must not import server code (bun:sqlite).
@@ -35,25 +37,37 @@ export default Plugin.define({
     // multi-retry burst from flooding the screen.
     const shown = new Set<string>();
     const off = context.data.on("session.synthetic", (event) => {
-      const data = event.data;
-      if (!data || typeof data.sessionID !== "string" || typeof data.text !== "string") return;
-      const meta = data.metadata as Record<string, unknown> | undefined;
-      const flag = meta?.[METADATA_KEY] as { kind?: unknown } | undefined;
-      const isRoutingFailure = flag?.kind === "routing-failure" || data.description === DESCRIPTION;
-      if (!isRoutingFailure) return;
+      try {
+        const data = event.data;
+        if (!data || typeof data.sessionID !== "string" || typeof data.text !== "string") return;
+        const meta = data.metadata as Record<string, unknown> | undefined;
+        const flag = meta?.[METADATA_KEY] as { kind?: unknown } | undefined;
+        const isRoutingFailure =
+          flag?.kind === "routing-failure" || data.description === DESCRIPTION;
+        if (!isRoutingFailure) return;
 
-      const key = `${data.sessionID}:${data.text}`;
-      if (shown.has(key)) return;
-      if (shown.size >= DEDUPE_CAP) shown.clear();
-      shown.add(key);
+        // Untrusted text (model ids, upstream errors) may carry control bytes;
+        // strip them and clamp the length before it reaches the screen.
+        const text = sanitizeForOutput(data.text, 300);
+        const key = `${data.sessionID}:${text}`;
+        if (shown.has(key)) return;
+        if (shown.size >= DEDUPE_CAP) shown.clear();
+        shown.add(key);
 
-      context.ui.toast.show({
-        title: "OpenRouter optimizer",
-        message: data.text,
-        variant: "error",
-        duration: 8000,
-        sessionID: data.sessionID,
-      });
+        context.ui.toast.show({
+          title: "OpenRouter optimizer",
+          message: text,
+          variant: "error",
+          duration: 8000,
+          sessionID: data.sessionID,
+        });
+      } catch (error) {
+        // A toast must never take the TUI host down with it.
+        console.warn(
+          "[openrouter-optimizer] failed to render routing failure:",
+          error instanceof Error ? error.message : error,
+        );
+      }
     });
     return () => off();
   },

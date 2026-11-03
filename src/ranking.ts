@@ -27,15 +27,33 @@ export interface OpenRouterEndpoint {
   toolCallErrorRate?: number;
 }
 
-/** Provider slug is the tag prefix, e.g. "deepinfra" for "deepinfra/turbo". */
+/** Provider slugs are short lowercase tags, canonicalised everywhere they are built. */
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+function isProviderSlug(value: string | undefined): value is string {
+  return typeof value === "string" && SLUG_PATTERN.test(value);
+}
+
+/**
+ * Provider slug is the tag prefix, e.g. "deepinfra" for "deepinfra/turbo". The tag
+ * path is canonicalised (trimmed, lower-cased) and validated; a tag or provider
+ * name that cannot produce a safe slug yields "" (the endpoint is dropped from
+ * ranking instead of crashing the refresh or injecting junk upstream).
+ */
 export function providerSlug(endpoint: OpenRouterEndpoint): string {
-  const fromTag = endpoint.tag?.split("/", 1)[0];
-  if (fromTag) return fromTag;
-  return (endpoint.provider_name ?? "")
+  const tag = endpoint?.tag;
+  if (typeof tag === "string") {
+    const fromTag = tag.split("/", 1)[0]?.trim().toLowerCase();
+    if (isProviderSlug(fromTag)) return fromTag;
+  }
+  const name = endpoint?.provider_name;
+  if (typeof name !== "string") return "";
+  const fromName = name
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+  return isProviderSlug(fromName) ? fromName : "";
 }
 
 export interface Filtered {
@@ -77,6 +95,11 @@ const FAILURE_WEIGHTS: Record<string, number> = {
  * requirement that is missing. A provider at 89.9% uptime (min 90) misses 0.1%
  * of what was asked for, one at 40% misses 55%.
  */
+const finiteIn = (value: unknown, min: number, max: number): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) && value >= min && value <= max
+    ? value
+    : undefined;
+
 function failureMagnitude(
   endpoint: OpenRouterEndpoint,
   reason: string,
@@ -86,21 +109,27 @@ function failureMagnitude(
     Math.min(1, Math.max(0, missing / Math.max(span, 1)));
   switch (reason) {
     case "uptime": {
-      const uptime = endpoint.uptime_last_30m ?? endpoint.uptime_last_1d ?? 100;
-      return ratio(options.minUptimePercent - uptime, options.minUptimePercent);
+      // Missing or invalid uptime never ranks better than a perfect score; a
+      // failed-check endpoint gets maximum magnitude instead.
+      const uptime =
+        finiteIn(endpoint.uptime_last_30m, 0, 100) ?? finiteIn(endpoint.uptime_last_1d, 0, 100);
+      return ratio(options.minUptimePercent - (uptime ?? 0), options.minUptimePercent);
     }
     case "tool-errors": {
       // The cap is a maximum, so the miss is measured against the headroom that
       // was left above it: twice the cap eats half of the remaining band.
-      const rate = endpoint.toolCallErrorRate ?? 0;
-      return ratio(rate - options.maxToolCallErrorRate, 100 - options.maxToolCallErrorRate);
+      const rate = finiteIn(endpoint.toolCallErrorRate, 0, 100);
+      return ratio(
+        (rate ?? 100) - options.maxToolCallErrorRate,
+        100 - options.maxToolCallErrorRate,
+      );
     }
     case "context": {
-      const length = endpoint.context_length ?? 0;
+      const length = finiteIn(endpoint.context_length, 0, 100_000_000) ?? 0;
       return ratio(options.minContextLength - length, options.minContextLength);
     }
     case "completion": {
-      const max = endpoint.max_completion_tokens ?? 0;
+      const max = finiteIn(endpoint.max_completion_tokens, 0, 100_000_000) ?? 0;
       return ratio(options.minMaxCompletionTokens - max, options.minMaxCompletionTokens);
     }
     default:
@@ -132,30 +161,49 @@ export function filterSeverity(
  * pricing. Returns every failed check (not just the first) so the debug print can show the
  * full diagnosis; an empty array means the endpoint passed all filters.
  */
+/** True when the value is an actual finite number; null/undefined mean "missing" (pass-through). */
+function presentFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/** True when the value is present but not usable: fails the filter closed. */
+function presentButInvalid(value: unknown, min: number, max: number): boolean {
+  if (value === null || value === undefined) return false;
+  return !presentFiniteNumber(value) || value < min || value > max;
+}
+
 export function filterEndpoint(endpoint: OpenRouterEndpoint, options: OptimizerOptions): string[] {
   const reasons: string[] = [];
   if (endpoint.status !== 0 && endpoint.status !== null && endpoint.status !== undefined)
     reasons.push("status");
   if (!hasKnownPricing(endpoint.pricing)) reasons.push("pricing");
-  const uptime = endpoint.uptime_last_30m ?? endpoint.uptime_last_1d ?? 100;
-  if (uptime < options.minUptimePercent) reasons.push("uptime");
-  if (
-    endpoint.toolCallErrorRate !== undefined &&
-    endpoint.toolCallErrorRate > options.maxToolCallErrorRate
-  ) {
-    reasons.push("tool-errors");
+  const uptime =
+    finiteIn(endpoint.uptime_last_30m, 0, 100) ?? finiteIn(endpoint.uptime_last_1d, 0, 100);
+  // Present-but-invalid uptime fails closed; missing uptime passes (no evidence,
+  // and the ranking must not guess it is 100).
+  if (presentButInvalid(endpoint.uptime_last_30m, 0, 100)) reasons.push("uptime");
+  else if (presentButInvalid(endpoint.uptime_last_1d, 0, 100)) reasons.push("uptime");
+  else if (uptime !== undefined && uptime < options.minUptimePercent) reasons.push("uptime");
+  if (endpoint.toolCallErrorRate !== undefined) {
+    if (!presentFiniteNumber(endpoint.toolCallErrorRate)) reasons.push("tool-errors");
+    else if (endpoint.toolCallErrorRate < 0 || endpoint.toolCallErrorRate > 100)
+      reasons.push("tool-errors");
+    else if (endpoint.toolCallErrorRate > options.maxToolCallErrorRate) reasons.push("tool-errors");
   }
-  if (endpoint.context_length !== null && endpoint.context_length < options.minContextLength) {
-    reasons.push("context");
+  if (endpoint.context_length !== null && endpoint.context_length !== undefined) {
+    if (presentButInvalid(endpoint.context_length, 0, 100_000_000)) reasons.push("context");
+    else if (endpoint.context_length < options.minContextLength) reasons.push("context");
   }
-  if (
-    endpoint.max_completion_tokens !== null &&
-    endpoint.max_completion_tokens < options.minMaxCompletionTokens
-  ) {
-    reasons.push("completion");
+  if (endpoint.max_completion_tokens !== null && endpoint.max_completion_tokens !== undefined) {
+    if (presentButInvalid(endpoint.max_completion_tokens, 0, 100_000_000))
+      reasons.push("completion");
+    else if (endpoint.max_completion_tokens < options.minMaxCompletionTokens)
+      reasons.push("completion");
   }
   if (options.requireToolSupport) {
-    const params = endpoint.supported_parameters ?? [];
+    const params = Array.isArray(endpoint.supported_parameters)
+      ? endpoint.supported_parameters
+      : [];
     if (!params.includes("tools") || !params.includes("tool_choice")) reasons.push("tools");
   }
   return reasons;
@@ -278,7 +326,11 @@ export function rankProviders(
   // The rescue picks the least-bad alias of a provider, so every failed alias has
   // to be kept until the mode is known (in free mode only a free alias may stand).
   const failing = new Map<string, Failure[]>();
-  for (const endpoint of endpoints) {
+  // A hostile upstream cannot make the ranking iterate without bound: at most
+  // this many endpoints are considered per refresh.
+  const MAX_ENDPOINTS = 512;
+  for (const endpoint of endpoints.slice(0, MAX_ENDPOINTS)) {
+    if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) continue;
     const slug = providerSlug(endpoint);
     if (!slug) continue;
     const filterReasons = filterEndpoint(endpoint, options);
@@ -399,14 +451,18 @@ export function rankProviders(
       // failing free one, and the request would route to a paid provider
       // against the preference. Every rescue is named in a warning.
       if (options.preferFreeProviders && a.free !== b.free) return a.free ? -1 : 1;
-      if (a.failure.severity !== b.failure.severity) return a.failure.severity - b.failure.severity;
+      const severity = (value: number): number =>
+        Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+      if (severity(a.failure.severity) !== severity(b.failure.severity)) {
+        return severity(a.failure.severity) - severity(b.failure.severity);
+      }
       if (a.failure.reasons.length !== b.failure.reasons.length) {
         return a.failure.reasons.length - b.failure.reasons.length;
       }
       const cost =
         requestCost(a.failure.endpoint.pricing, profile).perRequest -
         requestCost(b.failure.endpoint.pricing, profile).perRequest;
-      if (cost !== 0) return cost;
+      if (Number.isFinite(cost) && cost !== 0) return cost;
       return a.slug < b.slug ? -1 : 1;
     });
     for (const { slug, failure, pool } of candidates.slice(0, deficit)) {
@@ -452,7 +508,7 @@ export function rankProviders(
   // it holds every ranked-but-not-surviving slug. Filtered-out slugs are enforceable
   // (known providers) but only when at least one survivor keeps the route open.
   // extraIgnore always applies: it is the user's explicit instruction.
-  const blacklist =
+  const blacklistFull =
     survivors.length === 0
       ? [...new Set(options.extraIgnore)]
       : [
@@ -464,6 +520,8 @@ export function rankProviders(
             ].filter((slug) => !survivorSet.has(slug)),
           ),
         ];
+  // Enforce a hard ceiling: a hostile payload can never balloon the ignore list.
+  const blacklist = blacklistFull.filter((slug) => SLUG_PATTERN.test(slug)).slice(0, 512);
 
   // Ranked-but-not-surviving slugs are blocked by price (topN in cheapest mode,
   // paid-in-free-mode otherwise); extraIgnore is the user's explicit instruction.
@@ -476,10 +534,14 @@ export function rankProviders(
   }
   // Keep the blacklist's order and only include slugs that are actually blocked:
   // a slug can carry filter + price + extraIgnore reasons at once.
-  const blacklistReasons: Record<string, string[]> = {};
+  const blacklistReasons: Record<string, string[]> = Object.create(null) as Record<
+    string,
+    string[]
+  >;
   for (const slug of blacklist) {
+    if (slug === "__proto__") continue;
     const reasons = reasonMap.get(slug);
-    if (reasons && reasons.size > 0) blacklistReasons[slug] = [...reasons];
+    if (reasons && reasons.size > 0) blacklistReasons[slug] = [...reasons].slice(0, 32);
   }
 
   return {

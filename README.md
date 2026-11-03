@@ -17,8 +17,10 @@ every request, so you always land on one of the cheapest providers that actually
   `provider.ignore` (plus `provider.sort: "price"`) into each request.
 - Merges real usage data from OpenRouter Activity (when you provide a management key)
   and OpenCode's own stats, so ranking reflects how _you_ actually use each model.
-- Fails open: a request it cannot route goes out unmodified, with a `Routing failure`
-  message in the transcript and an error toast in the TUI, so you always know why.
+- Fails open: a request it cannot route goes out unmodified. When the session is attached,
+  the failure is surfaced as a `Routing failure` message in the transcript and an error
+  toast in the TUI (once per session/model/reason per process); when it is not, a one-line
+  warning is printed to the console instead. A routing failure is never silent.
 
 ## Requirements
 
@@ -104,10 +106,10 @@ You normally never need to set any option, the defaults are sane. Common tweaks:
 | `preferFreeProviders`                                             | `true`                      | $0 providers ("free mode") always stay routable; paid providers get blacklisted; the rescue floor also prefers free providers when none pass the filters                                              |
 | `extraIgnore`                                                     | `[]`                        | Provider slugs always blacklisted                                                                                                                                                                     |
 | `managementKeyEnv`                                                | `OPENROUTER_MANAGEMENT_KEY` | Env var name for the Activity key                                                                                                                                                                     |
-| `statsCommand`                                                    | `opencode`                  | CLI used for `stats --json` (background only)                                                                                                                                                         |
+| `statsCommand`                                                    | `opencode`                  | CLI used for `stats --json` (background only; executed with your user's privileges, with an allowlisted environment)                                                                                  |
 | `statsDays`                                                       | `30`                        | Stats window, aligned with the Activity 30-day aggregate                                                                                                                                              |
 | `statsCacheMinutes`                                               | `10`                        | Stats snapshot cache; concurrent refreshes share one snapshot                                                                                                                                         |
-| `dbPath`                                                          | global OpenCode data dir    | sqlite file override (tests)                                                                                                                                                                          |
+| `dbPath`                                                          | global OpenCode data dir    | sqlite file override (tests); foreign sqlite files are refused, never modified                                                                                                                        |
 | `debug`                                                           | `false`                     | Verbose logging                                                                                                                                                                                       |
 | `debugBlacklistReasons`                                           | `false`                     | With `debug`, also log why every blacklisted provider was blocked                                                                                                                                     |
 
@@ -233,7 +235,7 @@ A local clone can be loaded by OpenCode by path, the same way as the published p
 {
   "plugins": [
     {
-      "package": "D:/t3-projects/opencode-openrouter-optimizer",
+      "package": "/path/to/opencode-openrouter-optimizer",
       "options": { "debug": true },
     },
   ],

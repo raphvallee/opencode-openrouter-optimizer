@@ -8,10 +8,13 @@ import {
   fetchModelEndpoints,
   fetchOpenRouterProfile,
   fetchToolCallErrorRate,
+  isOpenRouterModelRef,
   permaslugFromEndpoints,
 } from "./openrouter.js";
 import { composeRouting, type ProviderRank, providerSlug, rankProviders } from "./ranking.js";
+import { readBoundedText } from "./http.js";
 import { type LocalProfile, mergeProfile, OpenCodeStats } from "./stats.js";
+import { errorMessage, sanitizeForOutput } from "./sanitize.js";
 
 interface HttpEventLike {
   request?: Request;
@@ -92,10 +95,18 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         console.error(LOG_PREFIX, error instanceof Error ? error.message : error);
         throw error;
       }
+      // Every externally derived string is scrubbed of control characters and
+      // clamped before it reaches the terminal; objects pass through untouched.
+      const sanitizeParts = (parts: unknown[]): unknown[] =>
+        parts.map((part) => {
+          if (typeof part === "string") return sanitizeForOutput(part, 500);
+          if (part instanceof Error) return errorMessage(part, 500);
+          return part;
+        });
       const debug = (...parts: unknown[]) => {
-        if (options.debug) console.log(LOG_PREFIX, ...parts);
+        if (options.debug) console.log(LOG_PREFIX, ...sanitizeParts(parts));
       };
-      const warn = (...parts: unknown[]) => console.warn(LOG_PREFIX, ...parts);
+      const warn = (...parts: unknown[]) => console.warn(LOG_PREFIX, ...sanitizeParts(parts));
 
       const db = new OptimizerDb(options.dbPath);
       const ttlMs = options.ttlHours * 3_600_000;
@@ -142,15 +153,36 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
        * Synthetic messages appear in the TUI, unlike console warnings buried in logs.
        * Fire-and-forget: a notification must never delay or fail the request.
        */
+      /** Keep a notice set bounded: when full, clear it (notices repeat, memory cannot grow). */
+      const capSet = (set: Set<string>, cap = 512): void => {
+        if (set.size >= cap) set.clear();
+      };
+      const untrackedWarned = new Set<string>();
+
       function notifyRoutingFailure(evt: HttpEventLike, reason: string, error?: unknown): void {
         const sessionID = evt.sessionID;
-        if (!sessionID) return;
         const model = typeof evt.model?.modelID === "string" ? evt.model.modelID : "unknown";
-        const key = `${sessionID}:${model}:${reason}`;
+        const safeModel = sanitizeForOutput(model, 120);
+        const safeReason = sanitizeForOutput(reason, 120);
+        const detail = error ? errorMessage(error, 200) : "";
+        const text = sanitizeForOutput(
+          `OpenRouter optimizer could not route ${safeModel} (${safeReason}); the request was sent unfiltered.${detail ? ` ${detail}` : ""}`,
+          300,
+        );
+        if (!sessionID) {
+          // Nothing else will surface this: log it, once per model+reason per process.
+          const key = `${safeModel}:${safeReason}`;
+          if (!untrackedWarned.has(key)) {
+            capSet(untrackedWarned);
+            untrackedWarned.add(key);
+            warn(text);
+          }
+          return;
+        }
+        const key = `${sessionID}:${safeModel}:${safeReason}`;
         if (notifiedFailures.has(key)) return;
+        capSet(notifiedFailures);
         notifiedFailures.add(key);
-        const detail = error instanceof Error ? error.message : error ? String(error) : "";
-        const text = `OpenRouter optimizer could not route ${model} (${reason}); the request was sent unfiltered.${detail ? ` ${detail}` : ""}`;
         void ctx.session
           .synthetic({
             sessionID,
@@ -300,6 +332,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           // the default token profile. Endpoints are still real, so the routing
           // is kept, but the guesswork must not be invisible.
           if (profile.numRequests === 0 && !unprofiledWarned.has(model)) {
+            capSet(unprofiledWarned);
             unprofiledWarned.add(model);
             warn(`${model}: no usage data available, ranking uses the default token profile`);
           }
@@ -319,6 +352,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
                 });
                 if (rates.size === 0) {
                   if (!toolRateWarned.has(model)) {
+                    capSet(toolRateWarned);
                     toolRateWarned.add(model);
                     warn(
                       `${model}: tool call error rate data is empty, ranking without the filter`,
@@ -332,6 +366,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
               } catch (error) {
                 if (isAbortError(error)) throw error;
                 if (!toolRateWarned.has(model)) {
+                  capSet(toolRateWarned);
                   toolRateWarned.add(model);
                   warn(
                     `tool call error rate unavailable for ${model}, ranking without it:`,
@@ -343,6 +378,7 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
               }
             } else {
               if (!toolRateWarned.has(model)) {
+                capSet(toolRateWarned);
                 toolRateWarned.add(model);
                 warn(
                   `tool call error rate skipped for ${model}: the endpoints payload carries no permaslug`,
@@ -361,6 +397,34 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
             computedAt: ranking.computedAt,
             mode: ranking.mode,
           };
+          const previous = routes.get(model)?.routing;
+          const zeroSurvivors = routing.survivors.length === 0;
+          const suspiciousEmpty =
+            zeroSurvivors && previous !== undefined && previous.survivors.length > 0;
+          if (suspiciousEmpty) {
+            // Refuse to let a wholesale collapse of the survivor set persist: keep the
+            // previous ranking, refresh its TTL markers instead of re-fetching on every
+            // request, and say so loudly.
+            warn(
+              `${model}: refresh produced zero survivors (previously ${previous?.survivors.length ?? "unknown"}); keeping the previous ranking and not persisting the empty one`,
+            );
+            if (previous) db.saveRefresh(model, previous, now, undefined, undefined);
+            const state = routes.get(model) ?? emptyState(model);
+            state.lastFetched = now;
+            state.lastAttempt = now;
+            state.attempts = 0;
+            state.retryAfter = null;
+            if (previous) state.routing = previous;
+            routes.set(model, state);
+            return;
+          }
+          if (routing.mode === "free" && previous && previous.mode !== "free") {
+            // The free-mode flip blacklists every paid provider; it must never pass
+            // unnoticed, and it is persisted for up to the refresh TTL.
+            warn(
+              `${model}: ranking entered free mode (a $0 endpoint was advertised); all paid providers are blacklisted until the next refresh; set preferFreeProviders: false to opt out`,
+            );
+          }
           // One write per refresh. Full rankings are debug-only payload; blacklist
           // reasons are always stored so the debug option works on any ranking.
           db.saveRefresh(
@@ -384,12 +448,14 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
             // Nothing is enforced and requests pass through unrouted; make that
             // visible once per model per process instead of debug-only.
             if (!unroutedWarned.has(model)) {
+              capSet(unroutedWarned);
               unroutedWarned.add(model);
               warn(`${model}: no endpoint passed the filters, requests pass through unrouted`);
             }
           } else if (ranking.rescued.length > 0 && !rescueWarned.has(model)) {
             // The floor kept providers that failed the filters, so the requests now
             // go to providers the filters rejected. Say which ones and why.
+            capSet(rescueWarned);
             rescueWarned.add(model);
             const details = ranking.rescued
               .map((slug) => {
@@ -592,13 +658,24 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         // Only OpenRouter traffic is ours to route. A provider explicitly configured as
         // something else (ollama, codex subscriptions, ...) is left untouched even if
         // its URL happens to contain openrouter.ai. When the provider ID is missing,
-        // fall back to the request URL.
+        // fall back to a strict hostname match on the request URL.
+        const isOpenRouterHostname = (raw: string): boolean => {
+          try {
+            const host = new URL(raw).hostname.toLowerCase();
+            return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
+          } catch {
+            return false;
+          }
+        };
         const isOpenRouter =
-          providerID === "openrouter" || (providerID === undefined && /openrouter\.ai/.test(url));
+          providerID === "openrouter" || (providerID === undefined && isOpenRouterHostname(url));
         if (!isOpenRouter) return;
 
         const now = Date.now();
-        const refModel = typeof evt.model?.modelID === "string" ? evt.model.modelID : "";
+        // An unbounded/garbage model reference is never persisted or cached; the
+        // request passes through untouched.
+        const eventModel = typeof evt.model?.modelID === "string" ? evt.model.modelID : "";
+        const refModel = isOpenRouterModelRef(eventModel) ? eventModel : "";
 
         // Fast path: the event already names the model. If its ranking has nothing to
         // inject (no blacklist, and sort injection is off or unsupported), the request
@@ -628,10 +705,26 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         // The body is a one-shot stream. Inspect a clone so an untouched request keeps
         // its original body; only a real routing change needs a replacement Request.
         let raw: string;
+        const MAX_BODY_BYTES = 25 * 1024 * 1024;
         try {
-          raw = await request.clone().text();
+          const clone = request.clone();
+          // content-length is only an optimisation; the streamed reader below is
+          // the actual enforcement for chunked/misreported bodies.
+          const declared = Number(clone.headers.get("content-length"));
+          if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+            warn(`request body is ${declared} bytes (> ${MAX_BODY_BYTES}); routing skipped`);
+            notifyRoutingFailure(evt, "request body too large");
+            return;
+          }
+          raw = await readBoundedText(clone.body, MAX_BODY_BYTES, "request body");
         } catch (error) {
-          warn("request body unreadable:", error instanceof Error ? error.message : error);
+          const message = errorMessage(error, 200);
+          if (message.includes("exceeds")) {
+            warn(`request body exceeds ${MAX_BODY_BYTES} bytes; routing skipped`);
+            notifyRoutingFailure(evt, "request body too large");
+            return;
+          }
+          warn("request body unreadable:", message);
           notifyRoutingFailure(evt, "request body unreadable", error);
           return;
         }
@@ -659,8 +752,8 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           return;
         }
 
-        if (typeof body !== "object" || body === null || !model.includes("/")) {
-          notifyRoutingFailure(evt, "invalid request body");
+        if (typeof body !== "object" || body === null || !isOpenRouterModelRef(model)) {
+          notifyRoutingFailure(evt, "invalid model reference");
           return;
         }
 
@@ -683,10 +776,11 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           notifyRoutingFailure(evt, "no ranking available");
           return;
         }
-        if (routing.survivors.length === 0) {
-          logRouting(model, state);
+        // Zero survivors: the ranking keeps the user's extraIgnore (explicit), so it
+        // still reaches the wire; sort is never injected - no known-good route exists.
+        const zeroSurvivors = routing.survivors.length === 0;
+        if (zeroSurvivors) {
           notifyRoutingFailure(evt, "no endpoint passed the filters");
-          return;
         }
         if (!hasInjection(routing)) {
           logRouting(model, state);
@@ -700,21 +794,38 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         mutated.provider = composeRouting(
           mutated.provider,
           routing.blacklist,
-          routing.survivors.length > 0 ? options : { ...options, injectSort: false },
+          zeroSurvivors ? { ...options, injectSort: false } : options,
         );
 
         const finalBody = JSON.stringify(mutated);
         const headers = new Headers(request.headers);
         headers.delete("content-length");
         try {
-          evt.request = new Request(request.url, {
+          // Preserve the parts of the original Request that matter to the transport;
+          // otherwise redirect/credentials/integrity silently revert to defaults.
+          const rebuilt: RequestInit = {
             method: request.method,
             headers,
             body: finalBody,
             signal: request.signal,
-          });
+          };
+          const source = request as unknown as Record<string, unknown>;
+          for (const key of [
+            "redirect",
+            "credentials",
+            "integrity",
+            "keepalive",
+            "cache",
+            "mode",
+            "referrer",
+            "referrerPolicy",
+          ] as const) {
+            const value = source[key];
+            if (value !== undefined) (rebuilt as unknown as Record<string, unknown>)[key] = value;
+          }
+          evt.request = new Request(request.url, rebuilt);
         } catch (error) {
-          warn("request rebuild failed:", error instanceof Error ? error.message : error);
+          warn("request rebuild failed:", errorMessage(error, 200));
           return;
         }
       }

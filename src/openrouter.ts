@@ -1,6 +1,7 @@
 /** OpenRouter HTTP clients (endpoints API: public; Activity API: management key). */
 
 import { providerSlug, type OpenRouterEndpoint } from "./ranking.js";
+import { readBoundedJson } from "./http.js";
 
 const BASE_URL = "https://openrouter.ai/api/v1";
 const FRONTEND_BASE_URL = "https://openrouter.ai/api/frontend";
@@ -59,6 +60,18 @@ export interface FetchOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+/** Cap on API payloads we are willing to buffer in memory. */
+const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024;
+/** A model slug is "author/name[:variant][#marker]"; anything else is never sent as a URL path. */
+const MODEL_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[A-Za-z0-9][A-Za-z0-9._:#-]{0,127}$/;
+const MAX_ENDPOINTS = 512;
+/** Hard ceiling on a model reference persisted to the db and kept in memory. */
+const MAX_MODEL_REF = 192;
+
+/** True when the value is a usable "author/name[:variant]" model reference. */
+export function isOpenRouterModelRef(model: unknown): model is string {
+  return typeof model === "string" && model.length <= MAX_MODEL_REF && MODEL_SLUG_RE.test(model);
+}
 
 /** Overall deadline for one API call, composed with the plugin shutdown signal. */
 function requestSignal(options: FetchOptions): AbortSignal {
@@ -73,23 +86,38 @@ export async function fetchModelEndpoints(
   const fetchImpl = options.fetchImpl ?? fetch;
   const base = options.baseUrl ?? BASE_URL;
   const signal = requestSignal(options);
+  if (!isOpenRouterModelRef(model)) {
+    // Never interpolate an unvalidated model id into the request path; callers
+    // treat this like any other fetch failure (the request passes through).
+    throw new OpenRouterError(`refusing to fetch endpoints for an unexpected model slug`, 0);
+  }
+  // Each segment is encoded separately, so "a/#think" and "a/../x" can never
+  // escape the /models/<author>/<name>/endpoints route. A literal ":" (the
+  // variant separator, e.g. "vendor/model:free") is kept raw, exactly like
+  // before encoding existed; everything else dangerous is percent-encoded.
+  const safeSegment = (segment: string): string =>
+    encodeURIComponent(segment).replace(/%3A/gi, ":");
+  const [author, rawName] = model.split("/");
+  const authorSegment = safeSegment(author);
 
-  async function get(slug: string): Promise<Response> {
-    // The slug is already a URL path ("author/name[:variant]"); do not encode the "/".
-    const response = await fetchImpl(`${base}/models/${slug}/endpoints`, {
-      headers: { accept: "application/json" },
-      signal,
-    });
+  async function get(name: string): Promise<Response> {
+    const response = await fetchImpl(
+      `${base}/models/${authorSegment}/${safeSegment(name)}/endpoints`,
+      {
+        headers: { accept: "application/json" },
+        signal,
+      },
+    );
     return response;
   }
 
-  let response = await get(model);
+  let response = await get(rawName);
   // Only a missing slug (404) is worth retrying without the variant suffix. Auth,
   // rate-limit and server errors come from the API, not the slug form: retrying
   // them just doubles the request pressure.
-  const stripped = baseModelSlug(model);
+  const stripped = baseModelSlug(rawName);
   const variantStatus = response.status;
-  if (response.status === 404 && stripped !== model) {
+  if (response.status === 404 && stripped !== rawName) {
     response = await get(stripped);
   }
   if (!response.ok) {
@@ -102,12 +130,22 @@ export async function fetchModelEndpoints(
       response.status,
     );
   }
-  const payload = (await response.json()) as { data?: EndpointsResponse };
+  const payload = (await readBoundedJson(
+    response,
+    MAX_PAYLOAD_BYTES,
+    `endpoints payload for ${model}`,
+  )) as {
+    data?: EndpointsResponse;
+  };
   const data = payload?.data;
   if (!data || !Array.isArray(data.endpoints)) {
     throw new OpenRouterError(`unexpected endpoints payload for ${model}`, response.status);
   }
-  return data;
+  // Drop anything that is not an object and never rank more than MAX_ENDPOINTS.
+  const endpoints = data.endpoints
+    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+    .slice(0, MAX_ENDPOINTS);
+  return { ...data, endpoints };
 }
 
 /**
@@ -139,13 +177,15 @@ export async function fetchOpenRouterProfile(
   const base = options.baseUrl ?? BASE_URL;
 
   const response = await fetchImpl(`${base}/activity`, {
+    // A redirect must never carry the management key to another origin; fail closed.
+    redirect: "error",
     headers: { accept: "application/json", authorization: `Bearer ${managementKey}` },
     signal: requestSignal(options),
   });
   if (!response.ok) {
     throw new OpenRouterError(`activity fetch failed: HTTP ${response.status}`, response.status);
   }
-  const payload = await response.json();
+  const payload = await readBoundedJson(response, MAX_PAYLOAD_BYTES, "activity payload");
   const rows = extractRows(payload);
   if (!rows) {
     throw new OpenRouterError(`unexpected activity payload for ${model}`, response.status);
@@ -212,11 +252,11 @@ export function sumActivity(rows: ActivityRow[], slugMatch: string): ActivityRes
 export function permaslugFromEndpoints(endpoints: OpenRouterEndpoint[]): string | undefined {
   const counts = new Map<string, number>();
   for (const endpoint of endpoints) {
-    const name = endpoint.name ?? "";
+    const name = typeof endpoint?.name === "string" ? endpoint.name : "";
     const separator = name.lastIndexOf("|");
     if (separator === -1) continue;
     const tail = name.slice(separator + 1).trim();
-    if (!tail || tail.includes("|")) continue;
+    if (!tail || tail.includes("|") || tail.length > 128) continue;
     counts.set(tail, (counts.get(tail) ?? 0) + 1);
   }
   let best: string | undefined;
@@ -303,7 +343,7 @@ export async function fetchToolCallErrorRate(
 
   const idToSlug = new Map<string, string>();
   for (const entry of unwrapData(
-    await perfResponse.json(),
+    await readBoundedJson(perfResponse, MAX_PAYLOAD_BYTES, `endpoint stats for ${permaslug}`),
     perfResponse.status,
     `endpoint stats for ${permaslug}`,
   ) as FrontendEndpoint[]) {
@@ -316,7 +356,7 @@ export async function fetchToolCallErrorRate(
   }
 
   const rows = unwrapData(
-    await rateResponse.json(),
+    await readBoundedJson(rateResponse, MAX_PAYLOAD_BYTES, `tool call error rate for ${permaslug}`),
     rateResponse.status,
     `tool call error rate for ${permaslug}`,
   ) as ToolCallErrorRow[];
@@ -356,23 +396,31 @@ export async function fetchToolCallErrorRate(
       const volume = volumes?.[id];
       // Volume is the daily request count behind the rate; without it the rate
       // cannot be weighted, so a lone unweighted sample must not decide the filter.
+      // Rates and volumes are also range-checked: an upstream that emits -100 or
+      // 1e18 can neither launder a tool-call problem nor silence it.
+      const volumeCapped =
+        typeof volume === "number" && Number.isFinite(volume) && volume <= 1e12 ? volume : 0;
       if (
         typeof rate !== "number" ||
         !Number.isFinite(rate) ||
-        typeof volume !== "number" ||
-        volume <= 0
+        rate < 0 ||
+        rate > 100 ||
+        volumeCapped <= 0
       )
         continue;
       const acc = sums.get(target) ?? { weighted: 0, volume: 0 };
-      acc.weighted += rate * volume;
-      acc.volume += volume;
+      acc.weighted += rate * volumeCapped;
+      acc.volume += volumeCapped;
       sums.set(target, acc);
     }
   }
 
   const rates = new Map<string, number>();
   for (const [target, acc] of sums) {
-    if (acc.volume > 0) rates.set(target, acc.weighted / acc.volume);
+    if (acc.volume > 0) {
+      const weighted = acc.weighted / acc.volume;
+      rates.set(target, Math.min(100, Math.max(0, weighted)));
+    }
   }
   if (rows.length > 0 && rates.size === 0) {
     // Rows arrived but none could be weighted: id mapping, rate, or volume drift.

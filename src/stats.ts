@@ -38,7 +38,69 @@ interface StatsModelRow {
 
 function num(value: unknown): number {
   const parsed = typeof value === "string" ? Number(value) : value;
-  return typeof parsed === "number" && Number.isFinite(parsed) ? parsed : 0;
+  return typeof parsed === "number" && Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+/** Read a child pipe with a hard byte ceiling; kills the child when exceeded. */
+async function readLimited(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  kill: () => void,
+  label: string,
+): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      kill();
+      await reader.cancel().catch(() => {});
+      throw new Error(`opencode stats ${label} exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
+/** Deliberately small allowlist: the child gets what it needs to run, nothing secret. */
+function minimalChildEnv(): Record<string, string> {
+  const keep = [
+    "PATH",
+    "Path",
+    "SystemRoot",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "LANG",
+    "LC_ALL",
+  ];
+  const env: Record<string, string> = {};
+  for (const key of Object.keys(process.env)) {
+    if (keep.includes(key) && process.env[key] !== undefined) {
+      env[key] = process.env[key] as string;
+    }
+  }
+  return env;
 }
 
 /** Parse `opencode stats --json --models` output into per-normalized-key profiles. */
@@ -60,7 +122,8 @@ export function parseStatsModels(json: string): Map<string, LocalProfile> {
     // install and still parses below.
     throw new Error("opencode stats output is missing the models array");
   }
-  for (const row of models as StatsModelRow[]) {
+  // Bound the work per snapshot regardless of what the CLI prints.
+  for (const row of (models as StatsModelRow[]).slice(0, 10_000)) {
     const id = typeof row?.model?.id === "string" ? row.model.id : undefined;
     if (!id) continue;
     const tokens = row.tokens ?? {};
@@ -231,14 +294,30 @@ export class OpenCodeStats {
 }
 
 async function defaultRun(args: string[]): Promise<string> {
-  const proc = Bun.spawn({ cmd: args, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const timer = setTimeout(() => proc.kill(), 60_000);
+  const proc = Bun.spawn({
+    cmd: args,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    windowsHide: true,
+    // The stats CLI does not need OPENROUTER_MANAGEMENT_KEY or any other exported
+    // secret; hand it an allowlisted environment instead of the whole process.env.
+    env: minimalChildEnv(),
+  });
+  const kill = (): void => {
+    try {
+      proc.kill();
+    } catch {
+      // already gone
+    }
+  };
+  const timer = setTimeout(kill, 60_000);
   try {
-    // Drain both pipes concurrently. An unread stderr can fill the OS buffer and
-    // block the child until the timeout kills it.
+    // Drain both pipes concurrently, each with a hard byte ceiling. An unread
+    // stderr can fill the OS buffer and block the child until the timeout kills it.
     const [output, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+      readLimited(proc.stdout, 10 * 1024 * 1024, kill, "stdout"),
+      readLimited(proc.stderr, 64 * 1024, kill, "stderr"),
     ]);
     const code = await proc.exited;
     if (code !== 0) {
