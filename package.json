@@ -1,6 +1,6 @@
 {
   "name": "opencode-openrouter-optimizer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode plugin that ranks OpenRouter providers by cost and injects a per-request provider blacklist to keep routes cheap.",
   "keywords": [
     "ai",

@@ -288,7 +288,7 @@ and run the install check:
 ```sh
 npm pack
 mkdir /tmp/check && cd /tmp/check && npm init -y
-npm install /path/to/opencode-openrouter-optimizer-0.1.0.tgz solid-js
+npm install /path/to/opencode-openrouter-optimizer-0.2.0.tgz solid-js
 cp /path/to/repo/scripts/check-install.mjs .
 bun check-install.mjs
 ```
