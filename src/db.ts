@@ -522,6 +522,10 @@ export class OptimizerDb {
         last_fetched = excluded.last_fetched,
         updated_at = excluded.updated_at
     `);
+    // details_json / blacklist_reasons_json use COALESCE so a refresh that
+    // carries no debug payload (the zero-survivors fallback calls saveRefresh
+    // with undefined) preserves the stored metadata instead of wiping it; an
+    // actual refresh with a payload overwrites it normally.
     this.saveRefreshStmt = this.db.prepare(`
       INSERT INTO fetches
         (model, last_fetched, last_attempt, attempts, retry_after,
@@ -536,8 +540,8 @@ export class OptimizerDb {
         blacklist_json = excluded.blacklist_json,
         mode = excluded.mode,
         computed_at = excluded.computed_at,
-        details_json = excluded.details_json,
-        blacklist_reasons_json = excluded.blacklist_reasons_json,
+        details_json = COALESCE(excluded.details_json, fetches.details_json),
+        blacklist_reasons_json = COALESCE(excluded.blacklist_reasons_json, fetches.blacklist_reasons_json),
         updated_at = excluded.updated_at
     `);
     this.recordFailureStmt = this.db.prepare(`

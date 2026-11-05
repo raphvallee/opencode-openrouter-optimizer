@@ -118,9 +118,14 @@ describe("OptimizerDb", () => {
       });
       expect(lean?.blacklistReasons).toBeUndefined();
 
-      // Refreshes without reasons clear the column instead of keeping stale data.
+      // A refresh that carries no reasons must not wipe the stored ones: the
+      // zero-survivors fallback re-saves the previous routing without a reason
+      // payload, and stale entries are harmless (consumers only look up slugs
+      // present in the current blacklist).
       db.saveRefresh("vendor/model", { survivors: ["a"], blacklist: [], computedAt: 30 }, 40);
-      expect(db.getFetch("vendor/model")?.blacklist_reasons_json).toBeNull();
+      expect(db.getFetch("vendor/model")?.blacklist_reasons_json).toEqual(
+        JSON.stringify({ b: ["uptime", "not-cheapest"], c: ["pricing"] }),
+      );
     } finally {
       db.close();
     }

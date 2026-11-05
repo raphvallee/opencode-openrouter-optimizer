@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A zero-survivors refresh no longer wipes the stored blacklist reasons and
+  debug rankings: the fallback that keeps the previous ranking re-saved it
+  without a metadata payload, and the UPSERT overwrote `details_json` and
+  `blacklist_reasons_json` with NULL, so debug logging showed "unknown" for
+  every blocked provider after a restart. The save now preserves the stored
+  payload when a refresh carries none (`COALESCE` in the UPSERT).
+
 ### Added
 
 - Routing-failure toasts are no longer TUI-only: a new `./gui-experimental` part
