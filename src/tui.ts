@@ -2,17 +2,8 @@
 
 import { Plugin } from "@opencode/plugin/tui";
 
-import { sanitizeForOutput } from "./sanitize.js";
-
-/**
- * Must match ROUTING_FAILURE_METADATA_KEY in src/plugin.ts. Duplicated on purpose:
- * this file runs in the TUI process and must not import server code (bun:sqlite).
- */
-const METADATA_KEY = "openrouter-optimizer";
-const DESCRIPTION = "Routing failure";
-
-/** Cap the dedupe set so a long-running TUI cannot grow it without bound. */
-const DEDUPE_CAP = 64;
+import { FailureDedupe, isRoutingFailure, syntheticFromInbox, toastText } from "./failure.js";
+import type { SyntheticPayload } from "./failure.js";
 
 export default Plugin.define({
   id: "openrouter-optimizer.tui",
@@ -35,40 +26,49 @@ export default Plugin.define({
     // visible even when the user is not reading the transcript. Deduped per
     // session+text: the server already throttles per process, and this keeps a
     // multi-retry burst from flooding the screen.
-    const shown = new Set<string>();
-    const off = context.data.on("session.synthetic", (event) => {
-      try {
-        const data = event.data;
-        if (!data || typeof data.sessionID !== "string" || typeof data.text !== "string") return;
-        const meta = data.metadata as Record<string, unknown> | undefined;
-        const flag = meta?.[METADATA_KEY] as { kind?: unknown } | undefined;
-        const isRoutingFailure =
-          flag?.kind === "routing-failure" || data.description === DESCRIPTION;
-        if (!isRoutingFailure) return;
-
-        // Untrusted text (model ids, upstream errors) may carry control bytes;
-        // strip them and clamp the length before it reaches the screen.
-        const text = sanitizeForOutput(data.text, 300);
-        const key = `${data.sessionID}:${text}`;
-        if (shown.has(key)) return;
-        if (shown.size >= DEDUPE_CAP) shown.clear();
-        shown.add(key);
-
-        context.ui.toast.show({
-          title: "OpenRouter optimizer",
-          message: text,
-          variant: "error",
-          duration: 8000,
-          sessionID: data.sessionID,
-        });
-      } catch (error) {
-        // A toast must never take the TUI host down with it.
-        console.warn(
-          "[openrouter-optimizer] failed to render routing failure:",
-          error instanceof Error ? error.message : error,
-        );
-      }
-    });
-    return () => off();
+    //
+    // Two transports carry the same message: current OpenCode versions publish
+    // it as a synthetic inbox item (`session.inbox.enqueued`), and the
+    // `session.synthetic` event remains the documented shape. Both funnel into
+    // one handler so a future release moving back to the direct event keeps
+    // toasts working.
+    const shown = new FailureDedupe();
+    const notify = (payload: SyntheticPayload | undefined | null): void => {
+      if (!isRoutingFailure(payload)) return;
+      const text = toastText(payload);
+      if (!shown.once(payload.sessionID, text)) return;
+      context.ui.toast.show({
+        title: "OpenRouter optimizer",
+        message: text,
+        variant: "error",
+        duration: 8000,
+        sessionID: payload.sessionID,
+      });
+    };
+    const offs = [
+      context.data.on("session.synthetic", (event) => {
+        try {
+          notify(event.data as SyntheticPayload);
+        } catch (error) {
+          // A toast must never take the TUI host down with it.
+          console.warn(
+            "[openrouter-optimizer] failed to render routing failure:",
+            error instanceof Error ? error.message : error,
+          );
+        }
+      }),
+      context.data.on("session.inbox.enqueued", (event) => {
+        try {
+          notify(syntheticFromInbox(event.data));
+        } catch (error) {
+          // A toast must never take the TUI host down with it.
+          console.warn(
+            "[openrouter-optimizer] failed to render routing failure:",
+            error instanceof Error ? error.message : error,
+          );
+        }
+      }),
+    ];
+    return () => offs.forEach((off) => off());
   },
 });

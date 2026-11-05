@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Routing-failure toasts are no longer TUI-only: a new `./gui-experimental` part
+  (`src/gui.tsx`, built as `dist/gui-experimental.cjs` with the
+  `@opencode/plugin/gui` vite preset) runs in every OpenCode Desktop window,
+  desktop app and web tabs alike, and raises the same error toast the TUI part
+  raises. The shared detection, sanitization and dedupe logic moved to
+  `src/failure.ts` so the two parts cannot drift.
+- A `noGUI` option (default `false`) turns the GUI part off, the way `noTUI`
+  turns the TUI part off; an invalid value is rejected at startup by the server
+  part, which also validates unknown option keys.
+
 ## [0.2.0] - 2026-11-02
 
 Security release. A full audit was run and its findings are fixed; see

@@ -53,6 +53,12 @@ export interface OptimizerOptions {
    * toasts are raised. The server routing part is unaffected.
    */
   noTUI: boolean;
+  /**
+   * Disable the GUI part of the plugin (the `./gui-experimental` export): no
+   * routing-failure toasts are raised in OpenCode Desktop windows (desktop app
+   * and web tabs). The server routing part is unaffected.
+   */
+  noGUI: boolean;
   /** Extra provider slugs that are always blacklisted (e.g. "chutes"). */
   extraIgnore: string[];
   /** Env var name for the OpenRouter management key (Activity API). */
@@ -95,6 +101,7 @@ export const DEFAULT_OPTIONS: OptimizerOptions = {
   fallbackCacheHitRate: 0.2,
   preferFreeProviders: true,
   noTUI: false,
+  noGUI: false,
   extraIgnore: [],
   managementKeyEnv: "OPENROUTER_MANAGEMENT_KEY",
   statsCommand: "opencode",
@@ -122,6 +129,7 @@ const OPTION_KEYS: ReadonlyArray<keyof OptimizerOptions> = [
   "fallbackCacheHitRate",
   "preferFreeProviders",
   "noTUI",
+  "noGUI",
   "extraIgnore",
   "managementKeyEnv",
   "statsCommand",
@@ -445,6 +453,7 @@ export function resolveOptions(input?: unknown): OptimizerOptions {
       DEFAULT_OPTIONS.preferFreeProviders,
     ),
     noTUI: booleanOption(raw, "noTUI", DEFAULT_OPTIONS.noTUI),
+    noGUI: booleanOption(raw, "noGUI", DEFAULT_OPTIONS.noGUI),
     extraIgnore: listOption(raw, "extraIgnore"),
     managementKeyEnv: managementKeyEnvOption(
       raw,
