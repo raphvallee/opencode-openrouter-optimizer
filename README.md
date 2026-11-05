@@ -6,7 +6,8 @@
 
 An OpenCode v2 plugin (Bun + TypeScript) that keeps OpenRouter routing cheap. It ranks
 OpenRouter providers by expected cost and injects a per-request provider blacklist into
-every request, so you always land on one of the cheapest providers that actually works.
+each routed request, so you always land on one of the cheapest providers that actually
+works.
 
 ## What it does
 
@@ -15,6 +16,11 @@ every request, so you always land on one of the cheapest providers that actually
   providers, and caches the result in memory (with a sqlite-backed snapshot for restarts).
 - Keeps the cheapest providers routable and blacklists the rest by injecting
   `provider.ignore` (plus `provider.sort: "price"`) into each request.
+- A model served by exactly one provider bypasses all of that: no filter runs, the
+  Tool Call Error Rate probe is never fetched, and the request goes out completely
+  unmodified (no `provider` block at all). The ranking is still recorded so the
+  pass-through is stable across restarts; blacklisting that provider in `extraIgnore`
+  is the one case where the bypass does not apply.
 - Merges real usage data from OpenRouter Activity (when you provide a management key)
   and OpenCode's own stats, so ranking reflects how _you_ actually use each model.
 - Fails open: a request it cannot route goes out unmodified. When the session is attached,
@@ -129,18 +135,23 @@ silently falling back to a default would change routing without telling you.
 
 For every OpenRouter model, the plugin filters endpoints by quality (context window,
 completion cap, uptime, tool-call support and error rate), ranks the survivors by
-expected cost, and lets only the cheapest few through. Three behaviors matter to know:
+expected cost, and lets only the cheapest few through. Four behaviors matter to know:
 
+- **Single-provider bypass**: when OpenRouter lists exactly one provider for a model,
+  no filter runs, the tool-call error rate probe is not fetched, and the request goes
+  out completely unmodified (no `provider` block at all). The ranking is still recorded
+  so the pass-through behaves the same after a restart. The bypass is skipped only when
+  that provider is named in `extraIgnore`.
 - **Cheapest-first routing**: the `topN` cheapest survivors (default 3) stay routable
   and `provider.sort: "price"` tells OpenRouter to prefer the cheapest of those.
 - **Free mode**: when any surviving provider serves the model at $0, every free provider
   stays routable (the top-3 cap does not apply to them) and all paid providers are
   blacklisted. Free status is judged at your workload's context length, so a tier that
   prices long contexts does not sneak in.
-- **The rescue floor**: if the quality filters would starve the routing (e.g. only 1
-  endpoint exists, or all fail context/uptime checks), the `keepAtLeastN` floor keeps
-  the least-bad providers instead of sending the request unrouted. `0` disables the
-  floor, the default `1` guarantees at least one provider stands.
+- **The rescue floor**: when a model has more than one provider and the quality filters
+  would starve the routing (e.g. all fail context/uptime checks), the `keepAtLeastN`
+  floor keeps the least-bad providers instead of sending the request unrouted. `0`
+  disables the floor, the default `1` guarantees at least one provider stands.
 
 The first request for a new model waits (up to `rankingWaitMs`, default 15s) for its
 ranking, so the session starts on the provider it will keep using and does not pay a

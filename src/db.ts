@@ -40,7 +40,8 @@ export interface RoutingSnapshot {
   survivors: string[];
   blacklist: string[];
   computedAt: number;
-  mode?: "free" | "cheapest";
+  /** "bypassed": the model has exactly one provider; no tests ran and no provider block is injected. */
+  mode?: "free" | "cheapest" | "bypassed";
 }
 
 /** Full snapshot used by tests, inspection and debug logging. */
@@ -275,8 +276,8 @@ function parseBlacklistReasons(json: string | null): Record<string, BlacklistRea
   }
 }
 
-function modeOf(value: string | null): "free" | "cheapest" {
-  return value === "free" ? "free" : "cheapest";
+function modeOf(value: string | null): "free" | "cheapest" | "bypassed" {
+  return value === "free" ? "free" : value === "bypassed" ? "bypassed" : "cheapest";
 }
 
 /** Build the in-memory state from a stored row. Parsing stays in one place. */
@@ -364,7 +365,7 @@ function migrate(db: Database): void {
               update.run(
                 JSON.stringify(survivors),
                 JSON.stringify(blacklist),
-                parsed.mode === "free" ? "free" : "cheapest",
+                parsed.mode === "free" || parsed.mode === "bypassed" ? parsed.mode : "cheapest",
                 typeof parsed.computedAt === "number" ? parsed.computedAt : row.updated_at,
                 details.length > 0 ? JSON.stringify(details) : null,
                 row.updated_at,

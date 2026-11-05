@@ -56,6 +56,34 @@ export function providerSlug(endpoint: OpenRouterEndpoint): string {
   return isProviderSlug(fromName) ? fromName : "";
 }
 
+/**
+ * A hostile upstream cannot make the ranking iterate without bound: at most
+ * this many endpoints are considered per refresh.
+ */
+const MAX_ENDPOINTS = 512;
+
+/**
+ * True when an endpoints payload names exactly one provider, by the same
+ * canonical slug logic the ranking uses. Returns that provider's slug, or
+ * undefined when the model has zero or several. The bypass decision: a model
+ * with a single provider sends its requests unmodified, so the refresh task
+ * uses this to skip the probes (tool call error rate) a bypassed model never
+ * needs. Endpoints whose slug cannot be canonicalized are not a provider:
+ * they are dropped everywhere anyway and do not make a multi-provider model.
+ */
+export function singleProviderSlug(endpoints: readonly OpenRouterEndpoint[]): string | undefined {
+  if (!Array.isArray(endpoints)) return undefined;
+  const seen = new Set<string>();
+  for (const endpoint of endpoints.slice(0, MAX_ENDPOINTS)) {
+    if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) continue;
+    const slug = providerSlug(endpoint);
+    if (!slug) continue;
+    seen.add(slug);
+    if (seen.size > 1) return undefined;
+  }
+  return seen.size === 1 ? [...seen][0] : undefined;
+}
+
 export interface Filtered {
   endpoint: OpenRouterEndpoint;
   slug: string;
@@ -401,7 +429,12 @@ export interface ProviderRank {
   failedReasons?: string[];
 }
 
-export type RankingMode = "free" | "cheapest";
+/**
+ * Why the ranking looks the way it does. "bypassed" means the model has
+ * exactly one provider: no test ran at all and the request goes out
+ * unmodified.
+ */
+export type RankingMode = "free" | "cheapest" | "bypassed";
 
 export interface Ranking {
   mode: RankingMode;
@@ -424,6 +457,65 @@ export interface Ranking {
   rescued: string[];
   profile: RequestProfile;
   computedAt: number;
+}
+
+/**
+ * The bypass ranking for a model served by exactly one provider. No test can
+ * change which provider serves the model, so none are run: the endpoint
+ * filters, free-mode blacklisting, the rescue floor and the tool call error
+ * rate probe are all skipped, and the request goes out unmodified.
+ *
+ * The rank entry reports the cheapest alias with known pricing (what a price
+ * sort would pick first if one were injected), so the debug output and the
+ * persisted ranking stay honest about cost. When no alias carries parseable
+ * pricing there is no honest price to report and the entry carries Infinity
+ * instead of a made-up number; the request is unaffected either way. The
+ * blacklist is empty: nothing is enforced, nothing is injected.
+ */
+function bypassRanking(
+  slug: string,
+  endpoints: OpenRouterEndpoint[],
+  profile: RequestProfile,
+  now: number,
+): Ranking {
+  const providerEndpoints: OpenRouterEndpoint[] = [];
+  for (const endpoint of endpoints.slice(0, MAX_ENDPOINTS)) {
+    if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) continue;
+    if (providerSlug(endpoint) === slug) providerEndpoints.push(endpoint);
+  }
+  // The slug came from the payload, so this cannot be empty.
+  let routed = providerEndpoints[0];
+  let perRequest = Number.POSITIVE_INFINITY;
+  for (const endpoint of providerEndpoints) {
+    if (!hasKnownPricing(endpoint.pricing, profile.avgInput)) continue;
+    const { perRequest: cost } = requestCost(endpoint.pricing, profile);
+    if (cost < perRequest) {
+      perRequest = cost;
+      routed = endpoint;
+    }
+  }
+  const slugUptime = routed.uptime_last_30m ?? routed.uptime_last_1d ?? 100;
+  const rankings: ProviderRank[] = [
+    {
+      slug,
+      endpoint: routed,
+      slugUptime,
+      perRequest,
+      total: totalCost(perRequest, profile.numRequests),
+      rank: 1,
+    },
+  ];
+  return {
+    mode: "bypassed",
+    rankings,
+    survivors: [slug],
+    blacklist: [],
+    // No provider is blocked, so there are no causes to record.
+    blacklistReasons: Object.create(null) as Record<string, BlacklistReason[]>,
+    rescued: [],
+    profile,
+    computedAt: now,
+  };
 }
 
 /**
@@ -482,6 +574,17 @@ export function rankProviders(
   options: OptimizerOptions,
 ): Ranking {
   const now = Date.now();
+  // Bypass: exactly one provider serves the model (and the user did not
+  // blacklist it in extraIgnore), so no test can change the routing and none
+  // are run. The request goes out completely unmodified; the tool call error
+  // rate probe is never sent (the refresh task skips it on the same signal).
+  // The routing is still recorded so restarts and later requests behave the
+  // same. A sole provider listed in extraIgnore is not bypassed: that list is
+  // an explicit instruction, and it survives the bypass decision untouched.
+  const soleProvider = singleProviderSlug(endpoints);
+  if (soleProvider !== undefined && !options.extraIgnore.includes(soleProvider)) {
+    return bypassRanking(soleProvider, endpoints, profile, now);
+  }
 
   // slug -> block causes. Always built: the payload is tiny, and persisting it with
   // every ranking is what makes debugBlacklistReasons useful on a stored ranking.
@@ -517,9 +620,6 @@ export function rankProviders(
   // The rescue picks the least-bad alias of a provider, so every failed alias has
   // to be kept until the mode is known (in free mode only a free alias may stand).
   const failing = new Map<string, Failure[]>();
-  // A hostile upstream cannot make the ranking iterate without bound: at most
-  // this many endpoints are considered per refresh.
-  const MAX_ENDPOINTS = 512;
   for (const endpoint of endpoints.slice(0, MAX_ENDPOINTS)) {
     if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) continue;
     const slug = providerSlug(endpoint);

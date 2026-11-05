@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A model served by exactly one provider bypasses the routing pipeline completely:
+  when OpenRouter lists only one provider, no endpoint test runs (context, completion
+  cap, uptime, status, pricing, tool support or the Tool Call Error Rate probe), no
+  blacklist and no `sort: "price"` is injected, and the request goes out completely
+  unmodified. The ranking is still recorded (mode `bypassed`) so the pass-through
+  behaves the same after a restart, and `debug` prints one line saying so. A provider
+  named in `extraIgnore` is never bypassed: that option keeps its existing meaning and
+  the usual routing rules apply.
 - `debugBlacklistReasons` output is now a debugging tool, not just a reason
   list: each blocked provider's causes carry the threshold they enforce
   (`uptime (min 90%)`), the provider's own value that missed it

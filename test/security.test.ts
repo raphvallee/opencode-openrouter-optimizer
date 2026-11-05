@@ -66,6 +66,18 @@ function starvedPayload() {
           status: 0,
           uptime_last_30m: 0,
         },
+        {
+          name: "B | m",
+          model_id: "vendor/model",
+          context_length: 128_000,
+          max_completion_tokens: 32_768,
+          pricing: { prompt: "0.0000002", completion: "0.0000004" },
+          provider_name: "B",
+          tag: "beta/fp8",
+          supported_parameters: ["tools", "tool_choice"],
+          status: 0,
+          uptime_last_30m: 0,
+        },
       ],
     },
   };

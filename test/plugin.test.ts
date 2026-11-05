@@ -1111,6 +1111,111 @@ describe("hot path", () => {
     }
   }, 10_000);
 
+  test("a one-provider model sends the request unmodified and skips the tool error rate probe", async () => {
+    const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY;
+    delete process.env.OPENROUTER_MANAGEMENT_KEY;
+    const savedFetch = globalThis.fetch;
+    const urls: string[] = [];
+    const warnings: string[] = [];
+    const logs: string[] = [];
+    const spy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "));
+    });
+    const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(" "));
+    });
+    // Failing health (uptime 40, a context below the floor) would normally be
+    // blacklisted; with one provider the optimizer never looks. The endpoint
+    // carries a permaslug tail, so a probe would be attempted if it ran.
+    const singleProviderPayload = {
+      data: {
+        id: "vendor/model",
+        name: "Vendor Model",
+        endpoints: [
+          {
+            name: "A | vendor/model",
+            model_id: "vendor/model",
+            context_length: 24_000,
+            max_completion_tokens: 8_192,
+            max_prompt_tokens: null,
+            pricing: { prompt: "0.0000001", completion: "0.0000002" },
+            provider_name: "A",
+            tag: "alpha/fp8",
+            supported_parameters: ["tools", "tool_choice"],
+            status: 0,
+            uptime_last_30m: 40,
+          },
+        ],
+      },
+    };
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      urls.push(url);
+      if (url === ENDPOINTS_URL)
+        return Promise.resolve(
+          new Response(JSON.stringify(singleProviderPayload), { status: 200 }),
+        );
+      // Any probe attempt lands here and fails the assertions below.
+      if (url.includes("/api/frontend/")) {
+        return Promise.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 }));
+      }
+      return savedFetch.bind(globalThis)(input as never, init);
+    }) as typeof fetch;
+
+    try {
+      const { ctx, hooks } = makeCtx({});
+      const plugin = definePlugin({
+        dbPath: ":memory:",
+        debug: true,
+        statsRun: async () => JSON.stringify({ models: [] }),
+      } as never);
+      const cleanup = await plugin.setup!(ctx as never);
+      try {
+        const handler = hooks.get("http.request")!.handler;
+        const evt = {
+          request: openRouterRequest(),
+          model: { providerID: "openrouter" },
+          kind: "primary",
+        };
+        await handler(evt);
+        // One provider, nothing to route around: no probe, no ranking work.
+        expect(urls.some((u) => u.includes("/api/frontend/"))).toBe(false);
+        const parsed = JSON.parse(await (evt as { request: Request }).request.text()) as {
+          provider?: { ignore?: string[]; sort?: string };
+        };
+        expect(parsed.provider).toBeUndefined();
+        // The ranking is recorded: the cached route passes through the same way.
+        const evt2 = {
+          request: openRouterRequest(),
+          model: { providerID: "openrouter", modelID: "vendor/model" },
+          kind: "primary",
+        };
+        await handler(evt2);
+        expect(
+          JSON.parse(await (evt2 as { request: Request }).request.text()).provider,
+        ).toBeUndefined();
+        // A bypassed model prices nothing, so there is no guesswork warning.
+        expect(warnings.some((line) => line.includes("no usage data available"))).toBe(false);
+        // ... and the debug log says why the request went out unmodified.
+        expect(
+          logs.some((line) => line.includes("(bypassed)") && line.includes("goes out unmodified")),
+        ).toBe(true);
+      } finally {
+        try {
+          await cleanup?.();
+        } finally {
+          spy.mockRestore();
+          logSpy.mockRestore();
+        }
+      }
+    } finally {
+      globalThis.fetch = savedFetch;
+      if (savedEnv === undefined) delete process.env.OPENROUTER_MANAGEMENT_KEY;
+      else process.env.OPENROUTER_MANAGEMENT_KEY = savedEnv;
+    }
+  }, 10_000);
+
   test("a missing management key and empty usage data are warned once", async () => {
     const savedEnv = process.env.OPENROUTER_MANAGEMENT_KEY;
     delete process.env.OPENROUTER_MANAGEMENT_KEY;

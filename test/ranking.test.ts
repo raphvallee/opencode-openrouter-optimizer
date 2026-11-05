@@ -7,6 +7,7 @@ import {
   filterEndpoint,
   rankProviders,
   providerSlug,
+  singleProviderSlug,
   type OpenRouterEndpoint,
 } from "../src/ranking.js";
 
@@ -239,13 +240,19 @@ describe("rankProviders", () => {
     expect(ranking.survivors).toEqual(["beta", "gamma", "delta"]);
     expect(ranking.blacklist).toContain("junk");
 
-    // A junk-priced endpoint alone must not poison the mode into "free".
+    // A junk-priced provider, with no other provider to bypass on, must not
+    // poison the mode into "free": both junk providers fail the price filter.
     const onlyJunk = rankProviders(
       [
         endpoint({
           provider_name: "junk",
           tag: "junk/fp8",
           pricing: { prompt: "N/A", completion: "N/A" },
+        }),
+        endpoint({
+          provider_name: "junk2",
+          tag: "junk2/fp8",
+          pricing: { prompt: "", completion: "" },
         }),
       ],
       profile,
@@ -435,7 +442,10 @@ describe("keepAtLeastN floor", () => {
 
   test("keepAtLeastN=0 disables the fallback", () => {
     const ranking = rankProviders(
-      [endpoint({ provider_name: "near", tag: "near/fp8", uptime_last_30m: 89.9 })],
+      [
+        endpoint({ provider_name: "near", tag: "near/fp8", uptime_last_30m: 89.9 }),
+        endpoint({ provider_name: "mid", tag: "mid/fp8", uptime_last_30m: 80 }),
+      ],
       profile,
       { ...DEFAULT_OPTIONS, keepAtLeastN: 0 },
     );
@@ -471,11 +481,13 @@ describe("keepAtLeastN floor", () => {
 
   test("a provider with a dead alias is never rescued even when another alias only misses a threshold", () => {
     // Routing is provider-wide: a rescued "mixed" would put its dead alias back
-    // on the route alongside the flaky one, so the provider is skipped.
+    // on the route alongside the flaky one, so the provider is skipped. The
+    // bystander is also unrescueable, so nobody qualifies for the floor.
     const ranking = rankProviders(
       [
         endpoint({ provider_name: "mixed", tag: "mixed/dead", status: 500 }),
         endpoint({ provider_name: "mixed", tag: "mixed/flaky", uptime_last_30m: 89.9 }),
+        endpoint({ provider_name: "bystander", tag: "bystander/fp8", status: 500 }),
       ],
       profile,
       DEFAULT_OPTIONS,
@@ -507,6 +519,7 @@ describe("keepAtLeastN floor", () => {
       [
         endpoint({ provider_name: "dead", tag: "dead/one", status: 500 }),
         endpoint({ provider_name: "dead", tag: "dead/two", status: 503 }),
+        endpoint({ provider_name: "bystander", tag: "bystander/fp8", status: 500 }),
       ],
       profile,
       DEFAULT_OPTIONS,
@@ -652,6 +665,7 @@ describe("keepAtLeastN floor", () => {
           pricing: { prompt: "0.0000001", completion: "0.0000001" },
           uptime_last_30m: 89.8,
         }),
+        endpoint({ provider_name: "other", tag: "other/fp8", uptime_last_30m: 75 }),
       ],
       profile,
       DEFAULT_OPTIONS,
@@ -665,7 +679,10 @@ describe("keepAtLeastN floor", () => {
 
   test("the rescued provider is marked with the checks it failed", () => {
     const ranking = rankProviders(
-      [endpoint({ provider_name: "flaky", tag: "flaky/fp8", uptime_last_30m: 89.9 })],
+      [
+        endpoint({ provider_name: "flaky", tag: "flaky/fp8", uptime_last_30m: 89.9 }),
+        endpoint({ provider_name: "other", tag: "other/fp8", uptime_last_30m: 75 }),
+      ],
       profile,
       DEFAULT_OPTIONS,
     );
@@ -911,5 +928,114 @@ describe("free-priority mode", () => {
         },
       ],
     });
+  });
+});
+
+describe("single-provider bypass", () => {
+  test("singleProviderSlug recognizes a one-provider payload and only that", () => {
+    expect(singleProviderSlug([])).toBeUndefined();
+    expect(singleProviderSlug(undefined as never)).toBeUndefined();
+    expect(singleProviderSlug([endpoint({ provider_name: "solo", tag: "solo/fp8" })])).toBe("solo");
+    // Aliases of the same provider are one provider.
+    expect(
+      singleProviderSlug([
+        endpoint({ provider_name: "solo", tag: "solo/fp8" }),
+        endpoint({ provider_name: "solo", tag: "solo/fp16" }),
+      ]),
+    ).toBe("solo");
+    expect(
+      singleProviderSlug([
+        endpoint({ provider_name: "solo", tag: "solo/fp8" }),
+        endpoint({ provider_name: "duo", tag: "duo/fp8" }),
+      ]),
+    ).toBeUndefined();
+    // Junk entries are not providers and do not count towards a second one.
+    expect(
+      singleProviderSlug([
+        { tag: 42 } as unknown as OpenRouterEndpoint,
+        endpoint({ provider_name: "solo", tag: "solo/fp8" }),
+      ]),
+    ).toBe("solo");
+    expect(singleProviderSlug([{ tag: 42 } as unknown as OpenRouterEndpoint])).toBeUndefined();
+  });
+
+  test("a one-provider model bypasses every filter and sends no blacklist", () => {
+    // Fails uptime, context, tools and status outright: the bypass does not
+    // look, so the request is not asked to prove anything.
+    const ranking = rankProviders(
+      [
+        endpoint({
+          provider_name: "solo",
+          tag: "solo/fp8",
+          uptime_last_30m: 40,
+          context_length: 24_000,
+          supported_parameters: ["response_format"],
+          status: 500,
+        }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    );
+    expect(ranking.mode).toBe("bypassed");
+    expect(ranking.survivors).toEqual(["solo"]);
+    expect(ranking.blacklist).toEqual([]);
+    expect(ranking.rescued).toEqual([]);
+    expect(ranking.rankings).toHaveLength(1);
+    expect(ranking.rankings[0].rank).toBe(1);
+    expect(ranking.blacklistReasons).toEqual({});
+  });
+
+  test("a one-provider model is not re-capped by topN or the floor", () => {
+    const many = ["solo", "solo"].map((name, index) =>
+      endpoint({ provider_name: name, tag: `solo/fp${8 * (index + 1)}` }),
+    );
+    const ranking = rankProviders(many, profile, { ...DEFAULT_OPTIONS, topN: 1 });
+    expect(ranking.mode).toBe("bypassed");
+    expect(ranking.survivors).toEqual(["solo"]);
+  });
+
+  test("an unpriceable only provider is bypassed with an unknown cost, never a guessed one", () => {
+    const junk = endpoint({
+      provider_name: "solo",
+      tag: "solo/fp8",
+      pricing: { prompt: "N/A", completion: "N/A" },
+    });
+    const ranking = rankProviders([junk], profile, DEFAULT_OPTIONS);
+    expect(ranking.mode).toBe("bypassed");
+    expect(ranking.survivors).toEqual(["solo"]);
+    expect(ranking.rankings[0].perRequest).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  test("a free one-provider model stays bypassed instead of flipping into free mode", () => {
+    const free = endpoint({
+      provider_name: "solo",
+      tag: "solo/fp8",
+      pricing: { prompt: "0", completion: "0" },
+    });
+    const ranking = rankProviders([free], profile, DEFAULT_OPTIONS);
+    expect(ranking.mode).toBe("bypassed");
+  });
+
+  test("extraIgnore naming the only provider disables the bypass", () => {
+    // The provider survives a healthy pipeline exactly like today: the bypass
+    // does not get to hide it, and no provider block is invented for it.
+    const ranking = rankProviders([endpoint({ provider_name: "solo", tag: "solo/fp8" })], profile, {
+      ...DEFAULT_OPTIONS,
+      extraIgnore: ["solo"],
+    });
+    expect(ranking.mode).toBe("cheapest");
+    expect(ranking.survivors).toEqual(["solo"]);
+  });
+
+  test("two providers still run the full pipeline", () => {
+    const ranking = rankProviders(
+      [
+        endpoint({ provider_name: "solo", tag: "solo/fp8" }),
+        endpoint({ provider_name: "duo", tag: "duo/fp8" }),
+      ],
+      profile,
+      DEFAULT_OPTIONS,
+    );
+    expect(ranking.mode).toBe("cheapest");
   });
 });

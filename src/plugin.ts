@@ -20,6 +20,7 @@ import {
   type ProviderRank,
   providerSlug,
   rankProviders,
+  singleProviderSlug,
 } from "./ranking.js";
 import { readBoundedText } from "./http.js";
 import { type LocalProfile, mergeProfile, OpenCodeStats } from "./stats.js";
@@ -332,6 +333,13 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
             fetchModelEndpoints(model, { signal: controller.signal }),
             buildProfile(model),
           ]);
+          // A model served by exactly one provider is bypassed: no test runs and
+          // the tool call error rate probe is never sent (see rankProviders). The
+          // profile above still runs (it started in parallel with the endpoints
+          // fetch), it is just unused by the bypassed ranking.
+          const soleProvider = singleProviderSlug(endpoints.endpoints);
+          const bypassed =
+            soleProvider !== undefined && !options.extraIgnore.includes(soleProvider);
           // buildProfile swallows aborts (Promise.allSettled inside), so a shutdown
           // mid-profile would otherwise persist a fallback-profile ranking as fresh
           // for the whole TTL. A completed endpoints fetch does not make it valid.
@@ -339,8 +347,9 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
 
           // A ranking computed from zero usage data prices every endpoint with
           // the default token profile. Endpoints are still real, so the routing
-          // is kept, but the guesswork must not be invisible.
-          if (profile.numRequests === 0 && !unprofiledWarned.has(model)) {
+          // is kept, but the guesswork must not be invisible. A bypassed model
+          // does not price anything, so there is nothing to warn about.
+          if (profile.numRequests === 0 && !bypassed && !unprofiledWarned.has(model)) {
             capSet(unprofiledWarned);
             unprofiledWarned.add(model);
             warn(`${model}: no usage data available, ranking uses the default token profile`);
@@ -351,7 +360,9 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           // but it must not be silent: warn once per model instead of ranking as if
           // every provider were below the cap. The permaslug comes from the endpoints
           // payload itself (its name tails), so no extra resolution request is needed.
-          if (options.maxToolCallErrorRate < 100) {
+          if (options.maxToolCallErrorRate < 100 && bypassed) {
+            debug(`${model}: single provider, skipping the tool call error rate probe`);
+          } else if (options.maxToolCallErrorRate < 100) {
             const permaslug = permaslugFromEndpoints(endpoints.endpoints);
             if (permaslug) {
               try {
@@ -478,13 +489,19 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
             );
           }
 
-          const debugParts = [
-            `ranked ${model} (${routing.mode}): top ${routing.survivors.length} = [${routing.survivors.join(", ")}]`,
-            `blacklist size ${routing.blacklist.length}`,
-          ];
-          if (ranking.rescued.length > 0)
-            debugParts.push(`rescued (failed the filters): [${ranking.rescued.join(", ")}]`);
-          debug(...debugParts);
+          if (routing.mode === "bypassed") {
+            debug(
+              `ranked ${model} (bypassed): the only provider is ${routing.survivors[0]}, the request goes out unmodified`,
+            );
+          } else {
+            const debugParts = [
+              `ranked ${model} (${routing.mode}): top ${routing.survivors.length} = [${routing.survivors.join(", ")}]`,
+              `blacklist size ${routing.blacklist.length}`,
+            ];
+            if (ranking.rescued.length > 0)
+              debugParts.push(`rescued (failed the filters): [${ranking.rescued.join(", ")}]`);
+            debug(...debugParts);
+          }
         } catch (error) {
           // A shutdown abort cancels the refresh; it is not a refresh failure and the
           // DB may already be closing, so skip failure bookkeeping entirely.
@@ -577,6 +594,10 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
       ): Promise<RoutingState> {
         if (!options.debugBlacklistReasons || !state.routing || state.blacklistReasons)
           return state;
+        // A bypassed ranking has no blocked providers to explain; without this
+        // the empty reason map would look missing forever and every request
+        // would force a re-rank.
+        if (state.routing.mode === "bypassed") return state;
         const task = ensureFresh(state, now, true);
         if (!task) return state;
         if (options.rankingWaitMs > 0) await waitForTask(task, options.rankingWaitMs);
@@ -587,9 +608,12 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
        * Whether a ranking gives the request path anything to inject: a blacklist to
        * enforce, or (with injectSort on) a price sort backed by at least one survivor.
        * With zero survivors there is no known-good route, so sort is never injected -
-       * it would steer OpenRouter straight to the providers the filters excluded.
+       * it would steer OpenRouter straight to the providers the filters excluded. A
+       * bypassed ranking (a model with exactly one provider) injects nothing at all:
+       * the request always goes out unmodified.
        */
       function hasInjection(routing: RoutingSnapshot): boolean {
+        if (routing.mode === "bypassed") return false;
         if (routing.blacklist.length > 0) return true;
         return options.injectSort && routing.survivors.length > 0;
       }
@@ -600,6 +624,12 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
         const routing = state?.routing;
         if (!routing) {
           debug(`routing ${model}: no ranking yet, passing through`);
+          return;
+        }
+        if (routing.mode === "bypassed") {
+          debug(
+            `routing ${model} (bypassed): ${routing.survivors[0] ?? "the only provider"} is the only provider for this model, the request goes out unmodified`,
+          );
           return;
         }
         if (routing.survivors.length === 0) {

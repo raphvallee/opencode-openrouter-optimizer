@@ -280,6 +280,27 @@ describe("OptimizerDb", () => {
     }
   });
 
+  test("a bypassed routing survives a round trip through the database", () => {
+    const db = new OptimizerDb(":memory:");
+    try {
+      db.saveRefresh(
+        "vendor/model",
+        { survivors: ["solo"], blacklist: [], computedAt: 10, mode: "bypassed" },
+        20,
+      );
+      const states = db.loadRoutingStates(false);
+      expect(states).toHaveLength(1);
+      expect(states[0].routing).toEqual({
+        survivors: ["solo"],
+        blacklist: [],
+        computedAt: 10,
+        mode: "bypassed",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   test("migrates a legacy rankings_json/endpoints_json database in place", () => {
     const dir = mkdtempSync(join(tmpdir(), "optimizer-db-"));
     const path = join(dir, "legacy.db");
