@@ -527,17 +527,25 @@ describe("http.request hook", () => {
 
       // epsilon alone loses the price race; u-one/u-two share the uptime filter failure
       // and are grouped; c-small has its own context failure. One group per line,
-      // indented under the header to show they belong to the routing request.
+      // indented under the header to show they belong to the routing request. Every
+      // cause is shown with the threshold it enforces, and every provider carries only
+      // the value that missed it, in the same order as the causes, ordered from the
+      // closest miss to the hardest failure.
       expect(reasonsHeader).toContain("providers blocked for vendor/model");
       const groupLines = logs.filter(
         (line) =>
-          line.includes(": u-one, u-two") ||
-          line.includes(": epsilon") ||
-          line.includes(": c-small"),
+          line.includes(": u-two") || line.includes(": epsilon") || line.includes(": c-small"),
       );
-      expect(groupLines.some((line) => line.includes("not-cheapest: epsilon"))).toBe(true);
-      expect(groupLines.some((line) => line.includes("uptime: u-one, u-two"))).toBe(true);
-      expect(groupLines.some((line) => line.includes("context: c-small"))).toBe(true);
+      expect(
+        groupLines.some((line) => line.includes("not-cheapest (top 3): epsilon ($0.021600)")),
+      ).toBe(true);
+      // u-two (50%) missed the 90% bar by less than u-one (40%): it leads the group.
+      expect(
+        groupLines.some((line) => line.includes("uptime (min 90%): u-two (50%), u-one (40%)")),
+      ).toBe(true);
+      expect(groupLines.some((line) => line.includes("context (min 64000): c-small (24000)"))).toBe(
+        true,
+      );
       expect(groupLines.some((line) => line.includes("unknown"))).toBe(false);
 
       await cleanup?.();

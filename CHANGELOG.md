@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `debugBlacklistReasons` output is now a debugging tool, not just a reason
+  list: each blocked provider's causes carry the threshold they enforce
+  (`uptime (min 90%)`), the provider's own value that missed it
+  (`u-one (40%)`), and providers sharing a cause group are ordered
+  from the closest miss to the hardest failure. When every provider is
+  blacklisted and only the `keepAtLeastN` floor keeps a route open, the log
+  shows which of your filters is the strictest and by how much. Reasons are
+  persisted with every ranking (threshold, value, miss magnitude), so
+  enabling the debug option works on stored rankings without waiting for a
+  re-rank; the `probe-reasons` probe prints the same format.
 - Routing-failure toasts are no longer TUI-only: a new `./gui-experimental` part
   (`src/gui.tsx`, built as `dist/gui-experimental.cjs` with the
   `@opencode/plugin/gui` vite preset) runs in every OpenCode Desktop window,

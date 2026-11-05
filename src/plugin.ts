@@ -11,7 +11,16 @@ import {
   isOpenRouterModelRef,
   permaslugFromEndpoints,
 } from "./openrouter.js";
-import { composeRouting, type ProviderRank, providerSlug, rankProviders } from "./ranking.js";
+import {
+  blacklistMissSeverity,
+  composeRouting,
+  formatBlacklistValue,
+  reasonThreshold,
+  type BlacklistReason,
+  type ProviderRank,
+  providerSlug,
+  rankProviders,
+} from "./ranking.js";
 import { readBoundedText } from "./http.js";
 import { type LocalProfile, mergeProfile, OpenCodeStats } from "./stats.js";
 import { errorMessage, sanitizeForOutput } from "./sanitize.js";
@@ -614,11 +623,15 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
               .filter((entry) => entry && allowed.has(entry.slug))
               .map((entry) => {
                 const price = `$${Number(entry.perRequest ?? 0).toFixed(6)}`;
-                // A rescued provider stands although it failed the filters: say so.
+                // A rescued provider stands although it failed the filters: say so,
+                // with the threshold each failed check enforces so the fallback is
+                // diagnosable the same way the blacklist is.
                 if (!entry.rescued) return `${entry.slug} (${price})`;
                 const failed = entry.failedReasons ?? [];
                 return failed.length > 0
-                  ? `${entry.slug} (${price}, rescued: failed ${failed.join(", ")})`
+                  ? `${entry.slug} (${price}, rescued: failed ${failed
+                      .map((reason) => `${reason} (${reasonThreshold(reason, options)})`)
+                      .join(", ")})`
                   : `${entry.slug} (${price}, rescued)`;
               })
           : routing.survivors;
@@ -626,24 +639,61 @@ export function definePlugin(overrides: Partial<OptimizerOptions> = {}) {
           `routing ${model} (${routing.mode ?? "cheapest"}): keeping ${selected.length} = [${selected.join(", ")}]`,
           `blocking ${routing.blacklist.length}`,
         );
-        // Per-provider block reasons, only with debugBlacklistReasons. Providers whose
-        // full reason sets are identical are grouped, one group per line so a repeated
-        // cause reads once; a slug without recorded reasons is called out explicitly.
+        // Per-provider block causes, only with debugBlacklistReasons. Providers whose
+        // full cause sets are identical are grouped, one group per line so a repeated
+        // cause reads once; a slug without recorded causes is called out explicitly.
+        // Every cause is shown with the threshold it enforces once per group, and
+        // every provider name carries only the values that missed those thresholds,
+        // in the same order as the causes, so a user who is debugging why nothing
+        // survives can see which criterion is the strictest and by how much without
+        // repeating the cause names per provider. Inside a group the providers are
+        // ordered from the closest miss to the hardest failure.
         if (options.debugBlacklistReasons) {
           const reasons = state?.blacklistReasons;
-          const groups = new Map<string, { list: string[]; slugs: string[] }>();
+          const groups = new Map<
+            string,
+            {
+              list: BlacklistReason[];
+              members: Array<{ slug: string; values: string; severity: number }>;
+            }
+          >();
           for (const slug of routing.blacklist) {
             const list = reasons?.[slug];
-            const sorted = list && list.length > 0 ? [...list].sort() : [];
-            const key = sorted.join("+");
+            const sorted =
+              list && list.length > 0
+                ? [...list].sort((a, b) => (a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : 0))
+                : [];
+            const key = sorted.map((entry) => `${entry.reason} (${entry.threshold})`).join(" + ");
+            // Only the values, in the same order as the causes on the group
+            // line: the reason names and thresholds are already stated there.
+            const values = sorted
+              .flatMap((entry) =>
+                entry.value === undefined ? [] : [formatBlacklistValue(entry.reason, entry.value)],
+              )
+              .join(", ");
+            const member = {
+              slug,
+              values,
+              severity:
+                sorted.length > 0 ? blacklistMissSeverity(sorted) : Number.POSITIVE_INFINITY,
+            };
             const group = groups.get(key);
-            if (group) group.slugs.push(slug);
-            else groups.set(key, { list: sorted, slugs: [slug] });
+            if (group) group.members.push(member);
+            else groups.set(key, { list: sorted, members: [member] });
           }
           debug(`  providers blocked for ${model}:`);
           for (const group of groups.values()) {
-            const reasonsText = group.list.length > 0 ? group.list.join(" + ") : "unknown";
-            debug(`    ${reasonsText}: ${group.slugs.join(", ")}`);
+            const reasonsText =
+              group.list.length > 0
+                ? group.list.map((entry) => `${entry.reason} (${entry.threshold})`).join(" + ")
+                : "unknown";
+            const members = [...group.members].sort((a, b) =>
+              a.severity !== b.severity ? a.severity - b.severity : a.slug < b.slug ? -1 : 1,
+            );
+            const membersText = members
+              .map((member) => (member.values ? `${member.slug} (${member.values})` : member.slug))
+              .join(", ");
+            debug(`    ${reasonsText}: ${membersText}`);
           }
         }
       }

@@ -285,12 +285,38 @@ describe("rankProviders", () => {
     const ranking = rankProviders(endpoints, profile, options);
     expect(ranking.blacklist).toEqual(["alpha", "epsilon", "theta", "zed"]);
     // alpha/epsilon lose the price race, theta fails the uptime filter, zed is the
-    // user's explicit instruction.
+    // user's explicit instruction. Every cause carries its threshold, the value
+    // that missed it, and how far past the threshold that value is.
+    const costOf = (slug: string) =>
+      ranking.rankings.find((rank) => rank.slug === slug)!.perRequest;
+    const cutoff = costOf("delta"); // the most expensive survivor sets the price bar
+    const priceMiss = (cost: number) => Math.min(1, Math.max(0, (cost - cutoff) / cutoff));
     expect(ranking.blacklistReasons).toEqual({
-      alpha: ["not-cheapest"],
-      epsilon: ["not-cheapest"],
-      theta: ["uptime"],
-      zed: ["extra-ignore"],
+      alpha: [
+        {
+          reason: "not-cheapest",
+          threshold: `top ${Math.max(DEFAULT_OPTIONS.topN, DEFAULT_OPTIONS.keepAtLeastN)}`,
+          value: costOf("alpha"),
+          magnitude: priceMiss(costOf("alpha")),
+        },
+      ],
+      epsilon: [
+        {
+          reason: "not-cheapest",
+          threshold: `top ${Math.max(DEFAULT_OPTIONS.topN, DEFAULT_OPTIONS.keepAtLeastN)}`,
+          value: costOf("epsilon"),
+          magnitude: priceMiss(costOf("epsilon")),
+        },
+      ],
+      theta: [
+        {
+          reason: "uptime",
+          threshold: `min ${DEFAULT_OPTIONS.minUptimePercent}%`,
+          value: 40,
+          magnitude: (DEFAULT_OPTIONS.minUptimePercent - 40) / DEFAULT_OPTIONS.minUptimePercent,
+        },
+      ],
+      zed: [{ reason: "extra-ignore", threshold: "user blacklist", magnitude: 1 }],
     });
   });
 
@@ -299,7 +325,21 @@ describe("rankProviders", () => {
     const ranking = rankProviders(endpoints, profile, options);
     // alpha is both too expensive for topN and explicitly ignored.
     expect(ranking.blacklist).toContain("alpha");
-    expect(ranking.blacklistReasons?.alpha).toEqual(["not-cheapest", "extra-ignore"]);
+    const costOf = (slug: string) =>
+      ranking.rankings.find((rank) => rank.slug === slug)!.perRequest;
+    const cutoff = costOf("delta");
+    const priceMiss = (cost: number) => Math.min(1, Math.max(0, (cost - cutoff) / cutoff));
+    // The causes are ordered from the closest miss to the hardest failure: the
+    // price miss (a hair over the bar) leads, the user's ignore trails.
+    expect(ranking.blacklistReasons?.alpha).toEqual([
+      {
+        reason: "not-cheapest",
+        threshold: `top ${Math.max(DEFAULT_OPTIONS.topN, DEFAULT_OPTIONS.keepAtLeastN)}`,
+        value: costOf("alpha"),
+        magnitude: priceMiss(costOf("alpha")),
+      },
+      { reason: "extra-ignore", threshold: "user blacklist", magnitude: 1 },
+    ]);
   });
 
   test("blacklistReasons reasons filters before pricing and covers every blacklist entry", () => {
@@ -309,7 +349,11 @@ describe("rankProviders", () => {
       pricing: { prompt: "", completion: "" },
     });
     const ranking = rankProviders([junk, ...endpoints], profile, DEFAULT_OPTIONS);
-    expect(ranking.blacklistReasons?.junk).toEqual(["pricing"]);
+    // Unparseable pricing has no value to show: only the threshold and the
+    // full-miss magnitude.
+    expect(ranking.blacklistReasons?.junk).toEqual([
+      { reason: "pricing", threshold: "parseable price", magnitude: 1 },
+    ]);
     for (const slug of ranking.blacklist) {
       expect(ranking.blacklistReasons?.[slug]).not.toBeNull();
       expect((ranking.blacklistReasons?.[slug] ?? []).length).toBeGreaterThan(0);
@@ -837,10 +881,35 @@ describe("free-priority mode", () => {
     const ranking = rankProviders([...paidEndpoints, ...freeEndpoints], profile, DEFAULT_OPTIONS);
     expect(ranking.mode).toBe("free");
     expect(ranking.blacklist).toEqual(["alpha", "beta", "gamma"]);
+    // Every paid cause carries the $0 threshold, the provider's own per-request
+    // cost, and a full miss magnitude: paid is an absolute failure of the mode.
+    const cost = (prompt: string, completion: string) =>
+      profile.avgInput * Number(prompt) + profile.avgOutput * Number(completion);
     expect(ranking.blacklistReasons).toEqual({
-      alpha: ["paid"],
-      beta: ["paid"],
-      gamma: ["paid"],
+      alpha: [
+        {
+          reason: "paid",
+          threshold: "$0",
+          value: cost("0.0000001", "0.0000002"),
+          magnitude: 1,
+        },
+      ],
+      beta: [
+        {
+          reason: "paid",
+          threshold: "$0",
+          value: cost("0.0000002", "0.0000004"),
+          magnitude: 1,
+        },
+      ],
+      gamma: [
+        {
+          reason: "paid",
+          threshold: "$0",
+          value: cost("0.0000003", "0.0000006"),
+          magnitude: 1,
+        },
+      ],
     });
   });
 });

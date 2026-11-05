@@ -209,6 +209,181 @@ export function filterEndpoint(endpoint: OpenRouterEndpoint, options: OptimizerO
   return reasons;
 }
 
+/**
+ * One recorded block cause with its threshold and how badly it was missed, so
+ * the debug output can show "why" and "by how much" for every blacklisted
+ * provider. Persisted with every ranking, so debugBlacklistReasons works on a
+ * stored ranking too.
+ */
+export interface BlacklistReason {
+  /** Canonical cause code: uptime, tool-errors, context, completion, status, pricing, tools, not-cheapest, paid, extra-ignore. */
+  reason: string;
+  /** Human-readable threshold the cause enforces, e.g. "min 90%" or "top 3". */
+  threshold: string;
+  /**
+   * The provider's own value for this cause, when it has one (uptime %, tool
+   * error rate %, context length, completion cap or per-request price). The
+   * best value across the provider's endpoints, i.e. the one that came closest
+   * to passing. Absent for causes with no number (status, pricing, tools,
+   * extra-ignore).
+   */
+  value?: number;
+  /**
+   * How far past the threshold the value is, clamped to 0..1: 0 is a hair's
+   * miss, 1 the worst possible (or a cause with no measurable miss). Persists
+   * so the debug output can order providers from the closest miss to the
+   * hardest failure without re-ranking.
+   */
+  magnitude: number;
+}
+
+/** Human-readable threshold for a block cause, shown in parentheses in debug output. */
+export function reasonThreshold(reason: string, options: OptimizerOptions): string {
+  switch (reason) {
+    case "uptime":
+      return `min ${options.minUptimePercent}%`;
+    case "tool-errors":
+      return `max ${options.maxToolCallErrorRate}%`;
+    case "context":
+      return `min ${options.minContextLength}`;
+    case "completion":
+      return `min ${options.minMaxCompletionTokens}`;
+    case "status":
+      return "endpoint serving";
+    case "pricing":
+      return "parseable price";
+    case "tools":
+      return "tools + tool_choice";
+    case "not-cheapest":
+      return `top ${Math.max(options.topN, options.keepAtLeastN)}`;
+    case "paid":
+      return "$0";
+    case "extra-ignore":
+      return "user blacklist";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * The endpoint's own numbers for the causes it failed, so the debug output can
+ * show how close each provider came to passing. A failure caused by unusable
+ * evidence (a null, non-finite or out-of-range value) records no value: there
+ * is nothing honest to show.
+ */
+function reasonValues(
+  endpoint: OpenRouterEndpoint,
+  reasons: string[],
+): Record<string, number | undefined> {
+  const values: Record<string, number | undefined> = {};
+  for (const reason of reasons) {
+    switch (reason) {
+      case "uptime":
+        // The same decision the filter made: invalid evidence fails closed and
+        // shows no value; a real number below the floor shows the number.
+        values[reason] =
+          presentButInvalid(endpoint.uptime_last_30m, 0, 100) ||
+          presentButInvalid(endpoint.uptime_last_1d, 0, 100)
+            ? undefined
+            : (finiteIn(endpoint.uptime_last_30m, 0, 100) ??
+              finiteIn(endpoint.uptime_last_1d, 0, 100));
+        break;
+      case "tool-errors": {
+        const rate = endpoint.toolCallErrorRate;
+        values[reason] =
+          rate !== undefined && finiteIn(rate, 0, 100) !== undefined ? rate : undefined;
+        break;
+      }
+      case "context":
+        values[reason] =
+          endpoint.context_length !== null && endpoint.context_length !== undefined
+            ? (finiteIn(endpoint.context_length, 0, 100_000_000) ?? undefined)
+            : undefined;
+        break;
+      case "completion":
+        values[reason] =
+          endpoint.max_completion_tokens !== null && endpoint.max_completion_tokens !== undefined
+            ? (finiteIn(endpoint.max_completion_tokens, 0, 100_000_000) ?? undefined)
+            : undefined;
+        break;
+      default:
+        values[reason] = undefined;
+    }
+  }
+  return values;
+}
+
+/**
+ * How far past its threshold a recorded cause is, on the same 0..1 scale as
+ * failureMagnitude so the debug ordering reads like the rescue ordering: lower
+ * is a closer miss. A cause with no usable value fails closed at 1. The price
+ * causes measure the miss against the per-request cost of the providers that
+ * stood (a hair above the cut-off is a near-miss, ten times it is a hard fail);
+ * "paid" is always a full miss against the $0 requirement.
+ */
+function reasonMagnitude(
+  reason: string,
+  value: number | undefined,
+  options: OptimizerOptions,
+  priceCutoff: number | undefined,
+): number {
+  const ratio = (missing: number, span: number): number =>
+    Math.min(1, Math.max(0, missing / Math.max(span, 1)));
+  switch (reason) {
+    case "uptime":
+      // A usable number below the floor misses by the share of the floor it is
+      // short; unusable evidence fails closed at a full miss.
+      return value === undefined
+        ? 1
+        : ratio(options.minUptimePercent - value, options.minUptimePercent);
+    case "tool-errors":
+      // The cap is a maximum, so the miss is measured against the headroom
+      // above it, the way failureMagnitude does.
+      return value === undefined
+        ? 1
+        : ratio(value - options.maxToolCallErrorRate, 100 - options.maxToolCallErrorRate);
+    case "context":
+      return value === undefined
+        ? 1
+        : ratio(options.minContextLength - value, options.minContextLength);
+    case "completion":
+      return value === undefined
+        ? 1
+        : ratio(options.minMaxCompletionTokens - value, options.minMaxCompletionTokens);
+    case "not-cheapest":
+      // Relative miss: just above the price cut-off is a hair's miss, many
+      // times it is a hard failure. The cut-off is the price of the providers
+      // that stood; without one the cause is a full miss.
+      return value === undefined || priceCutoff === undefined || priceCutoff <= 0
+        ? 1
+        : Math.min(1, Math.max(0, (value - priceCutoff) / priceCutoff));
+    default:
+      return 1;
+  }
+}
+
+/**
+ * Debug-only severity for a provider's recorded block causes, mirroring
+ * filterSeverity's weighting: lower means the provider missed its thresholds by
+ * less, so the debug output sorts "closest miss" first.
+ */
+export function blacklistMissSeverity(reasons: BlacklistReason[]): number {
+  let severity = 0;
+  for (const entry of reasons) severity += (FAILURE_WEIGHTS[entry.reason] ?? 20) * entry.magnitude;
+  return severity;
+}
+
+/** Debug display for a recorded cause value: percents show %, prices show $. */
+export function formatBlacklistValue(reason: string, value: number): string {
+  if (reason === "uptime" || reason === "tool-errors") {
+    // Two decimals at most, trailing zeros dropped: 1.04%, not 1.0445729%.
+    const rounded = Number(value.toFixed(2));
+    return `${rounded}%`;
+  }
+  if (reason === "not-cheapest" || reason === "paid") return `$${value.toFixed(6)}`;
+  return String(value);
+}
+
 export interface ProviderRank {
   slug: string;
   /** Best surviving endpoint for this provider. */
@@ -234,11 +409,13 @@ export interface Ranking {
   survivors: string[];
   blacklist: string[];
   /**
-   * slug -> reasons it was blacklisted (all of them, one entry per cause). Always
-   * built: reasons are stored with every ranking, so turning the debug option on
-   * later works immediately instead of showing nothing until the next re-rank.
+   * slug -> why it was blacklisted, one entry per cause with the threshold it
+   * enforces, the provider's own value for it (when there is one) and how far
+   * past the threshold that value is. Always built: reasons are stored with
+   * every ranking, so turning the debug option on later works immediately
+   * instead of showing nothing until the next re-rank.
    */
-  blacklistReasons?: Record<string, string[]>;
+  blacklistReasons?: Record<string, BlacklistReason[]>;
   /**
    * Providers that failed the endpoint filters but stood anyway, because
    * keepAtLeastN needed more providers to stand than the filters left. Empty when
@@ -309,10 +486,24 @@ export function rankProviders(
   // slug -> block causes. Always built: the payload is tiny, and persisting it with
   // every ranking is what makes debugBlacklistReasons useful on a stored ranking.
   const reasonMap = new Map<string, Set<string>>();
-  const addReason = (slug: string, reason: string) => {
+  // slug -> cause -> the provider's best (closest-to-passing) value for that
+  // cause across its endpoints: a provider whose aliases failed with 40% and
+  // 85% uptime shows the 85%, the alias that nearly made it.
+  const valueMap = new Map<string, Map<string, number>>();
+  const addReason = (slug: string, reason: string, value?: number) => {
     const existing = reasonMap.get(slug);
     if (existing) existing.add(reason);
     else reasonMap.set(slug, new Set([reason]));
+    if (value === undefined || !Number.isFinite(value)) return;
+    const values = valueMap.get(slug) ?? new Map<string, number>();
+    valueMap.set(slug, values);
+    const current = values.get(reason);
+    // For uptime/context/completion bigger is closer to passing; for the
+    // tool-error cap and the per-request price smaller is.
+    if (current === undefined) values.set(reason, value);
+    else if (reason === "uptime" || reason === "context" || reason === "completion")
+      values.set(reason, Math.max(current, value));
+    else values.set(reason, Math.min(current, value));
   };
 
   // 1) Endpoint filters: only surviving endpoints can claim "free" or be ranked.
@@ -336,7 +527,10 @@ export function rankProviders(
     const filterReasons = filterEndpoint(endpoint, options);
     if (filterReasons.length > 0) {
       filteredSlugs.add(slug);
-      for (const filterReason of filterReasons) addReason(slug, filterReason);
+      const endpointValues = reasonValues(endpoint, filterReasons);
+      for (const filterReason of filterReasons) {
+        addReason(slug, filterReason, endpointValues[filterReason]);
+      }
       const failure: Failure = {
         endpoint,
         reasons: filterReasons,
@@ -525,23 +719,53 @@ export function rankProviders(
 
   // Ranked-but-not-surviving slugs are blocked by price (topN in cheapest mode,
   // paid-in-free-mode otherwise); extraIgnore is the user's explicit instruction.
+  // The price cause carries the provider's per-request cost as its value: how
+  // far above the price cut-off it sits is what "not-cheapest" means here.
   const priceReason = freeMode ? "paid" : "not-cheapest";
-  for (const { slug } of eligible) {
-    if (!survivorSet.has(slug)) addReason(slug, priceReason);
+  for (const { endpoint, slug } of eligible) {
+    if (!survivorSet.has(slug))
+      addReason(slug, priceReason, requestCost(endpoint.pricing, profile).perRequest);
   }
   for (const slug of options.extraIgnore) {
     addReason(slug, "extra-ignore");
   }
   // Keep the blacklist's order and only include slugs that are actually blocked:
-  // a slug can carry filter + price + extraIgnore reasons at once.
-  const blacklistReasons: Record<string, string[]> = Object.create(null) as Record<
+  // a slug can carry filter + price + extraIgnore reasons at once. Each cause is
+  // persisted with its threshold, the provider's own value and how far past the
+  // threshold that value is, so the debug output can show what was missed and by
+  // how much on any stored ranking.
+  const priceCutoff = standing.length > 0 ? standing[standing.length - 1].perRequest : undefined;
+  const blacklistReasons: Record<string, BlacklistReason[]> = Object.create(null) as Record<
     string,
-    string[]
+    BlacklistReason[]
   >;
   for (const slug of blacklist) {
     if (slug === "__proto__") continue;
     const reasons = reasonMap.get(slug);
-    if (reasons && reasons.size > 0) blacklistReasons[slug] = [...reasons].slice(0, 32);
+    if (!reasons || reasons.size === 0) continue;
+    const values = valueMap.get(slug);
+    const entries: BlacklistReason[] = [...reasons]
+      .slice(0, 32)
+      .map((reason) => {
+        const value = values?.get(reason);
+        return value === undefined
+          ? {
+              reason,
+              threshold: reasonThreshold(reason, options),
+              magnitude: reasonMagnitude(reason, undefined, options, priceCutoff),
+            }
+          : {
+              reason,
+              threshold: reasonThreshold(reason, options),
+              value,
+              magnitude: reasonMagnitude(reason, value, options, priceCutoff),
+            };
+      })
+      // Closest miss first: the causes a provider almost passed lead its entry
+      // and the hardest failure trails, so the strictest of the user's filters
+      // is easy to spot when debugging.
+      .sort((a, b) => a.magnitude - b.magnitude || (a.reason < b.reason ? -1 : 1));
+    blacklistReasons[slug] = entries;
   }
 
   return {

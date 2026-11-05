@@ -97,17 +97,26 @@ describe("OptimizerDb", () => {
         { survivors: ["a"], blacklist: ["b", "c"], computedAt: 10, mode: "cheapest" },
         20,
         undefined,
-        { b: ["uptime", "not-cheapest"], c: ["pricing"] },
+        {
+          b: [
+            { reason: "uptime", threshold: "min 90%", value: 40, magnitude: 50 / 90 },
+            { reason: "not-cheapest", threshold: "top 3", value: 0.0042, magnitude: 1 },
+          ],
+          c: [{ reason: "pricing", threshold: "parseable price", magnitude: 1 }],
+        },
       );
       const states = db.loadRoutingStates();
-      expect(states.find((state) => state.model === "vendor/model")?.blacklistReasons).toEqual({
-        b: ["uptime", "not-cheapest"],
-        c: ["pricing"],
-      });
-      expect(db.getRankings("vendor/model")?.blacklistReasons).toEqual({
-        b: ["uptime", "not-cheapest"],
-        c: ["pricing"],
-      });
+      const reasonsPayload = {
+        b: [
+          { reason: "uptime", threshold: "min 90%", value: 40, magnitude: 50 / 90 },
+          { reason: "not-cheapest", threshold: "top 3", value: 0.0042, magnitude: 1 },
+        ],
+        c: [{ reason: "pricing", threshold: "parseable price", magnitude: 1 }],
+      };
+      expect(states.find((state) => state.model === "vendor/model")?.blacklistReasons).toEqual(
+        reasonsPayload,
+      );
+      expect(db.getRankings("vendor/model")?.blacklistReasons).toEqual(reasonsPayload);
       // A lean load skips the debug payload but keeps routing intact.
       const lean = db.loadRoutingStates(false).find((state) => state.model === "vendor/model");
       expect(lean?.routing).toEqual({
@@ -124,7 +133,13 @@ describe("OptimizerDb", () => {
       // present in the current blacklist).
       db.saveRefresh("vendor/model", { survivors: ["a"], blacklist: [], computedAt: 30 }, 40);
       expect(db.getFetch("vendor/model")?.blacklist_reasons_json).toEqual(
-        JSON.stringify({ b: ["uptime", "not-cheapest"], c: ["pricing"] }),
+        JSON.stringify({
+          b: [
+            { reason: "uptime", threshold: "min 90%", value: 40, magnitude: 50 / 90 },
+            { reason: "not-cheapest", threshold: "top 3", value: 0.0042, magnitude: 1 },
+          ],
+          c: [{ reason: "pricing", threshold: "parseable price", magnitude: 1 }],
+        }),
       );
     } finally {
       db.close();
@@ -141,7 +156,7 @@ describe("OptimizerDb", () => {
         { survivors: ["a"], blacklist: ["b"], computedAt: 10, mode: "cheapest" },
         20,
         undefined,
-        { b: ["uptime"] },
+        { b: [{ reason: "uptime", threshold: "min 90%", value: 40, magnitude: 50 / 90 }] },
       );
       const raw = new Database(path);
       raw.run(

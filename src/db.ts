@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { baseModelSlug } from "./openrouter.js";
 import { stripControlChars } from "./sanitize.js";
+import type { BlacklistReason } from "./ranking.js";
 
 /**
  * Normalized cross-provider model key: lowercase, dots -> dashes, variant suffixes
@@ -45,7 +46,7 @@ export interface RoutingSnapshot {
 /** Full snapshot used by tests, inspection and debug logging. */
 export interface RankingSnapshot extends RoutingSnapshot {
   rankings: unknown[];
-  blacklistReasons?: Record<string, string[]>;
+  blacklistReasons?: Record<string, BlacklistReason[]>;
 }
 
 /** In-memory state for one model: fetch bookkeeping plus the compact routing. */
@@ -57,7 +58,7 @@ export interface RoutingState {
   retryAfter: number | null;
   routing?: RoutingSnapshot;
   details?: unknown[];
-  blacklistReasons?: Record<string, string[]>;
+  blacklistReasons?: Record<string, BlacklistReason[]>;
 }
 
 const SCHEMA = `
@@ -202,27 +203,70 @@ function parseDetails(json: string | null): unknown[] | undefined {
 }
 
 /**
- * slug -> why it was blacklisted (one entry per cause). Debug-only payload: a
- * malformed value just means no reasons are shown, never a routing change.
+ * One persisted block cause: the check, the threshold it enforces, the value
+ * it was measured against and how far past the threshold that value is.
+ * Debug-only payload: a malformed value just means no reasons are shown, never
+ * a routing change.
  */
-function parseBlacklistReasons(json: string | null): Record<string, string[]> | undefined {
+function parseBlacklistReason(value: unknown): BlacklistReason | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.reason !== "string" ||
+    record.reason.length === 0 ||
+    record.reason.length > 40 ||
+    typeof record.threshold !== "string" ||
+    record.threshold.length === 0 ||
+    record.threshold.length > 200
+  ) {
+    return undefined;
+  }
+  if (
+    record.value !== undefined &&
+    (typeof record.value !== "number" || !Number.isFinite(record.value))
+  )
+    return undefined;
+  if (
+    typeof record.magnitude !== "number" ||
+    !Number.isFinite(record.magnitude) ||
+    record.magnitude < 0 ||
+    record.magnitude > 1
+  ) {
+    return undefined;
+  }
+  const parsed: BlacklistReason = {
+    reason: record.reason,
+    threshold: record.threshold,
+    magnitude: record.magnitude,
+  };
+  if (record.value !== undefined) parsed.value = record.value;
+  return parsed;
+}
+
+/**
+ * slug -> why it was blacklisted, one entry per cause with its threshold, the
+ * provider's value and the miss magnitude. A payload in the pre-threshold
+ * shape (plain strings) reads as missing so the debug path's bounded re-rank
+ * rewrites it in the richer shape on the next refresh.
+ */
+function parseBlacklistReasons(json: string | null): Record<string, BlacklistReason[]> | undefined {
   if (!json) return undefined;
   try {
     const parsed: unknown = JSON.parse(json);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-    const out: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+    const out = Object.create(null) as Record<string, BlacklistReason[]>;
     let entries = 0;
     for (const [slug, reasons] of Object.entries(parsed)) {
       if (entries >= MAX_SLUGS) return undefined;
       if (!isSlug(slug) || slug === "__proto__") return undefined;
-      if (
-        !Array.isArray(reasons) ||
-        reasons.length > 32 ||
-        reasons.some((r) => typeof r !== "string" || r.length > 200)
-      ) {
-        return undefined;
+      if (!Array.isArray(reasons) || reasons.length > 32) return undefined;
+      const parsedReasons: BlacklistReason[] = [];
+      for (const reason of reasons) {
+        const parsedReason = parseBlacklistReason(reason);
+        if (!parsedReason) return undefined;
+        parsedReasons.push(parsedReason);
       }
-      out[slug] = reasons as string[];
+      out[slug] = parsedReasons;
       entries += 1;
     }
     return out;
@@ -619,7 +663,7 @@ export class OptimizerDb {
     routing: RoutingSnapshot,
     now: number,
     details?: unknown[],
-    blacklistReasons?: Record<string, string[]>,
+    blacklistReasons?: Record<string, BlacklistReason[]>,
   ): void {
     this.assertOpen();
     const survivors = [...new Set(routing.survivors)].filter(isSlug).slice(0, MAX_SLUGS);
