@@ -92,19 +92,20 @@ jobs:
         with:
           bun-version: 1.4.3
 
-      # The tarball install below resolves its own dependency tree from the registry, so only npm's
-      # download cache is kept: npm revalidates cached metadata and still picks up new releases.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.npm/_cacache
-          key: npm-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-
       # Only the build needs these; `npm pack` below runs the prepack and prepare scripts itself.
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
 
       - name: Pack
         run: npm pack
+
+      # Restored after the pack so that unpacking it does not slow the build, and the tarball install
+      # reads it while it is warm. Only npm's download cache is kept: the install resolves its own
+      # dependency tree, and npm revalidates cached metadata, so new releases are still picked up.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm/_cacache
+          key: npm-${{ runner.os }}-${{ hashFiles('bun.lock') }}
 
       - name: Install the tarball
         run: |
