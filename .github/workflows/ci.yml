@@ -1,9 +1,34 @@
 name: CI
 
 on:
+  # Only run when a file the verify or install jobs depend on changes.
   push:
     branches: [main]
+    paths:
+      - "src/**"
+      - "test/**"
+      - "scripts/**"
+      - "package.json"
+      - "bun.lock"
+      - "tsconfig.json"
+      - "tsconfig.build.json"
+      - "vite.config.ts"
+      - ".oxlintrc.json"
+      - ".oxfmtrc.json"
+      - ".github/workflows/ci.yml"
   pull_request:
+    paths:
+      - "src/**"
+      - "test/**"
+      - "scripts/**"
+      - "package.json"
+      - "bun.lock"
+      - "tsconfig.json"
+      - "tsconfig.build.json"
+      - "vite.config.ts"
+      - ".oxlintrc.json"
+      - ".oxfmtrc.json"
+      - ".github/workflows/ci.yml"
   workflow_dispatch:
 
 permissions:
