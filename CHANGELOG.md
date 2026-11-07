@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.0] - 2026-11-07
 
+Feature release. Models served by a single provider now skip routing, and
+routing-failure toasts also reach OpenCode Desktop windows, not only the TUI.
+No breaking changes; the one behavior change is that a single-provider model's
+request goes out unmodified.
+
 ### Fixed
 
 - A zero-survivors refresh no longer wipes the stored blacklist reasons and
