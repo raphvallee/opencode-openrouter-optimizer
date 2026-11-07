@@ -23,10 +23,30 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     environment: release
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The cheap checks come first so a bad tag fails before the install and the verify run.
+      - name: Verify the release tag matches package.json
+        if: github.event_name == 'release'
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$VERSION" || {
+            echo "Release tag '$GITHUB_REF_NAME' does not match package.json version '$VERSION'"
+            exit 1
+          }
+
+      - name: Validate the npm dist-tag
+        env:
+          PUBLISH_TAG: ${{ inputs.tag || 'latest' }}
+        run: |
+          printf '%s' "$PUBLISH_TAG" | grep -E '^[a-z0-9][a-z0-9._-]{0,127}$' > /dev/null || {
+            echo "Invalid npm tag: must match ^[a-z0-9][a-z0-9._-]{0,127}\$"
+            exit 1
+          }
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -37,32 +57,16 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      # The root `prepare` script would run husky and a build that the Build step does anyway.
+      # No dependency cache in a release job: only the lockfile decides what ships.
       - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Verify the release tag matches package.json
-        if: github.event_name == 'release'
-        run: |
-          VERSION="$(node -p "require('./package.json').version")"
-          test "$GITHUB_REF_NAME" = "v$VERSION" || {
-            echo "Release tag '$GITHUB_REF_NAME' does not match package.json version '$VERSION'"
-            exit 1
-          }
+        run: bun install --frozen-lockfile --ignore-scripts
 
       - name: Verify
         run: bun run verify
 
       - name: Build
         run: bun run build
-
-      - name: Validate the npm dist-tag
-        env:
-          PUBLISH_TAG: ${{ inputs.tag || 'latest' }}
-        run: |
-          printf '%s' "$PUBLISH_TAG" | grep -E '^[a-z0-9][a-z0-9._-]{0,127}$' > /dev/null || {
-            echo "Invalid npm tag: must match ^[a-z0-9][a-z0-9._-]{0,127}\$"
-            exit 1
-          }
 
       - name: Update npm CLI
         # Staged publishing requires npm >= 11.15; the npm bundled with node 22 is older.
