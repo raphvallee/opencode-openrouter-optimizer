@@ -42,6 +42,7 @@ jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,8 +52,9 @@ jobs:
         with:
           bun-version: 1.4.3
 
+      # The root `prepare` script would run husky and a build that the Build step does anyway.
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        run: bun install --frozen-lockfile --ignore-scripts
 
       - name: Format
         run: bun run fmt:check
@@ -69,12 +71,18 @@ jobs:
       - name: Build
         run: bun run build
 
+      # dist/ is built above; the install job runs the real pack with its prepack and prepare scripts.
       - name: Pack
-        run: npm pack --dry-run
+        run: npm pack --dry-run --ignore-scripts
 
   install:
     name: Install the packed plugin
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # A throwaway install gains nothing from the registry audit or the funding notice.
+      NPM_CONFIG_AUDIT: "false"
+      NPM_CONFIG_FUND: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -84,8 +92,16 @@ jobs:
         with:
           bun-version: 1.4.3
 
+      # The tarball install below resolves its own dependency tree from the registry, so only npm's
+      # download cache is kept: npm revalidates cached metadata and still picks up new releases.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm/_cacache
+          key: npm-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      # Only the build needs these; `npm pack` below runs the prepack and prepare scripts itself.
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        run: bun install --frozen-lockfile --ignore-scripts
 
       - name: Pack
         run: npm pack
